@@ -11,6 +11,7 @@ Run via orchestrator_node.py (sources both ros2_config.sh and hpp_config.sh).
 """
 
 import os
+import subprocess
 import sys
 import glob
 import tempfile
@@ -37,7 +38,7 @@ from pyhpp.core import RandomShortcut, SplineGradientBased_bezier3
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
-from agimus_msgs.msg import MpcInput
+from agimus_msgs.msg import MpcInput, MpcEEInput
 from sensor_msgs.msg import JointState
 from nav_msgs.msg import Odometry
 
@@ -49,8 +50,6 @@ _PKG_DIR    = os.path.join(_HPP_DIR, "..")
 ROBOT_SRDF  = os.path.join(_HPP_DIR, "tiago_pro.srdf")
 PYLONE_SRDF = os.path.join(_HPP_DIR, "pylone.srdf")
 PYLONE_URDF = os.path.join(_PKG_DIR, "urdf", "pylone.urdf")
-TABLE_SRDF  = os.path.join(_HPP_DIR, "table.srdf")
-TABLE_URDF  = os.path.join(_PKG_DIR, "urdf", "table.urdf")
 GROUND_SRDF = os.path.join(_HPP_DIR, "ground.srdf")
 GROUND_URDF = os.path.join(_PKG_DIR, "urdf", "ground.urdf")
 
@@ -61,13 +60,7 @@ with open(_CFG_FILE) as _f:
 DT         = _cfg["trajectory"]["dt"]
 TIME_SCALE = _cfg["trajectory"]["time_scale"]
 
-_s        = _cfg["scene"]
-TABLE_X   = _s["table_x"]
-TABLE_Y   = _s["table_y"]
-TABLE_Z   = _s["table_z"]
-PYLONE_X  = TABLE_X
-PYLONE_Y  = TABLE_Y
-PYLONE_Z  = _s["pylone_z_offset"]
+_PYLONE_POSE_FILE = os.path.join(_PKG_DIR, "config", "pylone_pose.yaml")
 
 _h           = _cfg["handle"]
 HANDLE_LINK  = _h["link"]
@@ -83,7 +76,9 @@ W_Q         = np.array(_w["w_q"])
 W_QDOT      = np.array(_w["w_qdot"])
 W_QDDOT     = np.array(_w["w_qddot"])
 W_EFFORT    = np.array(_w["w_effort"])
-W_COLLISION = _w["w_collision"]
+W_COLLISION   = _w["w_collision"]
+W_FRAME_TRANS = np.array(_w["w_frame_trans"])
+W_FRAME_ROT   = np.array(_w["w_frame_rot"])
 
 
 class _TrajectoryPublisherNode(Node):
@@ -185,12 +180,6 @@ class Orchestrator:
             pin.SE3.Identity(),
         )
         urdf.loadModel(
-            robot, 0, "table", "anchor",
-            TABLE_URDF,
-            TABLE_SRDF,
-            pin.SE3(np.eye(3), np.array([TABLE_X, TABLE_Y, TABLE_Z])),
-        )
-        urdf.loadModel(
             robot, 0, "pylone", "freeflyer",
             PYLONE_URDF,
             PYLONE_SRDF,
@@ -213,15 +202,15 @@ class Orchestrator:
             -3.0, 3.0, -3.0, 3.0,
             -float("Inf"), float("Inf"), -float("Inf"), float("Inf"),
         ])
-        robot.setJointBounds("pylone/root_joint", [
-            PYLONE_X - 0.01, PYLONE_X + 0.01,
-            PYLONE_Y - 0.01, PYLONE_Y + 0.01,
-            PYLONE_Z - 0.01, PYLONE_Z + 0.01,
-            -float("Inf"), float("Inf"),
-            -float("Inf"), float("Inf"),
-            -float("Inf"), float("Inf"),
-            -float("Inf"), float("Inf"),
-        ])
+
+        with open(_PYLONE_POSE_FILE) as _pf:
+            _pc = yaml.safe_load(_pf)
+        _px = _pc["pylone_x"]
+        _py = _pc["pylone_y"]
+        _pz = _pc["pylone_z"]
+        _pq = _pc.get("pylone_quat", [0.0, 0.0, 0.0, 1.0])
+
+        self._set_pylone_bounds(_px, _py, _pz)
 
         # Add handle: Rx(-90°) so handle Z = world +Y (into the hole)
         _R = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]])
@@ -241,7 +230,14 @@ class Orchestrator:
         self._left_arm_lock_values = list(LEFT_ARM_TUCK)
         self.q_init[li:li+7] = LEFT_ARM_TUCK
         self.q_init[ri:ri+7] = RIGHT_ARM_TUCK
-        self.q_init[pi:pi+7] = [PYLONE_X, PYLONE_Y, PYLONE_Z, 0., 0., 0., 1.]
+        self.q_init[pi:pi+3] = [_px, _py, _pz]
+        self.q_init[pi+3:pi+7] = _pq
+
+        self._pin_data = model.createData()
+        ee_frame_name = "tiago_pro/gripper_right_tool_holder"
+        self._ee_frame_id = model.getFrameId(ee_frame_name)
+        if self._ee_frame_id == model.nframes:
+            raise RuntimeError(f"Frame '{ee_frame_name}' not found in model")
 
     # ── Constraint graph setup ─────────────────────────────────────────────────
 
@@ -289,12 +285,7 @@ class Orchestrator:
                      "gripper_left_inner_finger_right_joint",
                      "gripper_left_fingertip_right_joint",
                      "gripper_left_outer_finger_right_joint",
-                     "gripper_right_finger_joint",
-                     "gripper_right_inner_finger_left_joint",
-                     "gripper_right_fingertip_left_joint",
-                     "gripper_right_inner_finger_right_joint",
-                     "gripper_right_fingertip_right_joint",
-                     "gripper_right_outer_finger_right_joint"]:
+                     "gripper_right_tool_mount_joint"]:
             locked.append(_lock(f"tiago_pro/{name}", 0.0))
         locked.append(_lock("tiago_pro/head_1_joint", 0.0))
         locked.append(_lock("tiago_pro/head_2_joint", 0.0))
@@ -303,7 +294,6 @@ class Orchestrator:
 
         sm = SecurityMargins(problem, factory, ["tiago_pro", "pylone"], robot)
         sm.setSecurityMarginBetween("tiago_pro", "pylone", 0.05)
-        sm.setSecurityMarginBetween("tiago_pro", "table", 0.05)
         sm.apply()
 
         for jname in model.names:
@@ -463,6 +453,20 @@ class Orchestrator:
         msg.w_qddot               = W_QDDOT.tolist()
         msg.w_robot_effort        = W_EFFORT.tolist()
         msg.w_collision_avoidance = W_COLLISION
+
+        T_ee = self._fk_ee_world(q)
+        quat = pin.Quaternion(T_ee.rotation)
+        ee_input = MpcEEInput()
+        ee_input.frame_id = "gripper_right_tool_holder"
+        ee_input.pose.position.x = float(T_ee.translation[0])
+        ee_input.pose.position.y = float(T_ee.translation[1])
+        ee_input.pose.position.z = float(T_ee.translation[2])
+        ee_input.pose.orientation.x = float(quat.x)
+        ee_input.pose.orientation.y = float(quat.y)
+        ee_input.pose.orientation.z = float(quat.z)
+        ee_input.pose.orientation.w = float(quat.w)
+        ee_input.w_pose = list(np.concatenate([W_FRAME_TRANS, W_FRAME_ROT]))
+        msg.ee_inputs = [ee_input]
         return msg
 
     def _build_messages(self, paths: list, n_hold: int = 200) -> list:
@@ -766,6 +770,317 @@ class Orchestrator:
             e = q_ref[ri+i] - q_actual[ri+i]
             print(f"    arm_right_{i+1}_joint : {e:+.4f} rad  ({np.degrees(e):+.2f}°)")
         print(f"{'='*58}\n")
+
+    # ── Pylone pose update ────────────────────────────────────────────────────
+
+    def _set_pylone_bounds(self, x, y, z, margin: float = 0.001):
+        """Lock pylone position with tight bounds so HPP cannot move it."""
+        self.robot.setJointBounds("pylone/root_joint", [
+            x - margin, x + margin,
+            y - margin, y + margin,
+            z - margin, z + margin,
+            -float("Inf"), float("Inf"),
+            -float("Inf"), float("Inf"),
+            -float("Inf"), float("Inf"),
+            -float("Inf"), float("Inf"),
+        ])
+
+    def reload_pylone_pose(self) -> None:
+        """Read pylone pose from config/pylone_pose.yaml and update q_init."""
+        if not os.path.exists(_PYLONE_POSE_FILE):
+            print(f"No pylone pose file found at {_PYLONE_POSE_FILE}.")
+            print("Run scripts/localize_pylone.py or o.localize_pylone_from_mocap() first.")
+            return
+        with open(_PYLONE_POSE_FILE) as f:
+            cfg = yaml.safe_load(f)
+        t = [cfg["pylone_x"], cfg["pylone_y"], cfg["pylone_z"]]
+        q = cfg.get("pylone_quat", [0.0, 0.0, 0.0, 1.0])
+        self.update_pylone_pose(t, q)
+
+    def update_pylone_pose(self, t: list, q: list = None) -> None:
+        """Update pylone pose in q_init and display in Viser if open.
+
+        t: [x, y, z] in HPP world frame
+        q: [qx, qy, qz, qw] orientation (default: identity)
+        """
+        t = np.array(t)
+        q = np.array(q) if q is not None else np.array([0., 0., 0., 1.])
+        self._set_pylone_bounds(t[0], t[1], t[2])
+        pi = self._pylone_idx
+        self.q_init[pi:pi+3]   = t
+        self.q_init[pi+3:pi+7] = q
+        if hasattr(self, "_viewer"):
+            self._viewer(self.q_init)
+        print(f"Pylone pose updated: t={np.round(t, 4).tolist()}, q={np.round(q, 4).tolist()}.")
+        if not hasattr(self, "_viewer"):
+            print("Call o.init_viewer() to visualize.")
+
+    # ── FK helpers ────────────────────────────────────────────────────────────
+
+    def _base_se3_from_q(self, q: np.ndarray) -> pin.SE3:
+        """Extract base SE3 (in HPP world frame) from a full config vector."""
+        bi = self._base_idx
+        bx, by     = q[bi], q[bi + 1]
+        cos_t, sin_t = q[bi + 2], q[bi + 3]
+        R = np.array([[cos_t, -sin_t, 0.0],
+                      [sin_t,  cos_t, 0.0],
+                      [0.0,    0.0,   1.0]])
+        return pin.SE3(R, np.array([bx, by, 0.0]))
+
+    def _fk_ee_rel_base(self, q_full: np.ndarray) -> pin.SE3:
+        """FK of gripper_right_tool_holder relative to base_link."""
+        pin.forwardKinematics(self.model, self._pin_data, q_full)
+        pin.updateFramePlacements(self.model, self._pin_data)
+        T_base_world = self._base_se3_from_q(q_full)
+        return T_base_world.inverse() * self._pin_data.oMf[self._ee_frame_id]
+
+    def _active_q_to_full(self, q_active: np.ndarray) -> np.ndarray:
+        """Map active q [base(4), arm(7)] back to full HPP config vector."""
+        q_full = pin.neutral(self.model).copy()
+        q_full[self._base_idx:self._base_idx + 4]       = q_active[:4]
+        q_full[self._right_arm_idx:self._right_arm_idx + 7] = q_active[4:11]
+        return q_full
+
+    def _fk_ee_world(self, q_active: np.ndarray) -> pin.SE3:
+        """FK of gripper_right_tool_holder in HPP world frame (for MpcEEInput)."""
+        q_full = self._active_q_to_full(q_active)
+        pin.forwardKinematics(self.model, self._pin_data, q_full)
+        pin.updateFramePlacements(self.model, self._pin_data)
+        return self._pin_data.oMf[self._ee_frame_id].copy()
+
+    # ── Mocap (Qualisys) ─────────────────────────────────────────────────────
+
+    _QUALISYS_IP    = "140.93.1.100"
+    _MOCAP_BODIES   = {"pylone": 0, "tiago_endEffector": 1, "tiago_base": 2}
+    _MOCAP_BASE_IDX = 2  # tiago_base = reference frame
+
+    def connect_mocap(self, ip: str = _QUALISYS_IP) -> None:
+        """Start the Qualisys mocap subprocess.  Call once before
+        compare_mocap() or localize_pylone_from_mocap()."""
+        _scripts_dir = os.path.join(_PKG_DIR, "scripts")
+        if _scripts_dir not in sys.path:
+            sys.path.insert(0, _scripts_dir)
+        from qualisys import QualisysClient  # noqa: PLC0415
+        self._qc = QualisysClient(ip=ip, bodies=self._MOCAP_BODIES)
+        time.sleep(1.0)
+        print(f"Mocap connected to {ip}.")
+
+    def disconnect_mocap(self) -> None:
+        """Stop the Qualisys subprocess."""
+        if hasattr(self, "_qc"):
+            self._qc.stop()
+            del self._qc
+            print("Mocap disconnected.")
+
+    def _mocap_se3(self, idx: int) -> pin.SE3:
+        """Return pinocchio SE3 for Qualisys body index *idx*."""
+        pos  = self._qc.getPositions()[idx]        # (3,) metres
+        quat = self._qc.getOrientationQuats()[idx]  # (4,) [qx qy qz qw]
+        return pin.XYZQUATToSE3(np.concatenate([pos, quat]))
+
+    def compare_mocap(self, timeout: float = 5.0) -> None:
+        """Compare mocap poses vs robot FK, relative to base_link / tiago_base.
+
+        Prints position error (mm) and rotation error (deg) for:
+          • end effector  (tiago_endEffector  ↔  gripper_right_tool_holder)
+          • pylone        (pylone             ↔  q_init pylone pose)
+
+        Requires connect_mocap() and sync_from_robot() to have been called.
+        """
+        if not hasattr(self, "_qc"):
+            print("No mocap client — call connect_mocap() first.")
+            return
+
+        print("Reading current robot state …")
+        try:
+            q_actual = self._read_robot_config(timeout)
+        except RuntimeError as e:
+            print(f"compare_mocap: {e}")
+            return
+
+        # ── Mocap relative poses (w.r.t. tiago_base) ──────────────────────
+        T_mocap_base    = self._mocap_se3(self._MOCAP_BASE_IDX)
+        T_rel_ee_mocap  = T_mocap_base.inverse() * self._mocap_se3(1)  # tiago_endEffector
+        T_rel_pyl_mocap = T_mocap_base.inverse() * self._mocap_se3(0)  # pylone
+
+        # ── Robot poses (relative to base_link) ───────────────────────────
+        T_rel_ee_robot  = self._fk_ee_rel_base(q_actual)
+
+        pi = self._pylone_idx
+        T_pyl_world    = pin.XYZQUATToSE3(
+            np.concatenate([self.q_init[pi:pi+3], self.q_init[pi+3:pi+7]])
+        )
+        T_base_world   = self._base_se3_from_q(q_actual)
+        T_rel_pyl_robot = T_base_world.inverse() * T_pyl_world
+
+        # ── Helpers ────────────────────────────────────────────────────────
+        def _breakdown(T_a: pin.SE3, T_b: pin.SE3):
+            delta  = T_a.inverse() * T_b
+            dt_mm  = delta.translation * 1e3
+            drpy   = np.degrees(pin.utils.matrixToRpy(delta.rotation))
+            return dt_mm, drpy
+
+        def _print_body(label: str, T_mocap: pin.SE3, T_robot: pin.SE3) -> None:
+            t_m   = T_mocap.translation
+            t_r   = T_robot.translation
+            rpy_m = np.degrees(pin.utils.matrixToRpy(T_mocap.rotation))
+            rpy_r = np.degrees(pin.utils.matrixToRpy(T_robot.rotation))
+            dt_mm, drpy = _breakdown(T_mocap, T_robot)
+            norm_t = np.linalg.norm(dt_mm)
+            norm_r = np.linalg.norm(drpy)
+            flag   = "✓" if norm_t < 20 and norm_r < 5 else "!"
+
+            print(f"\n  {label}")
+            print(f"  {'':4s}{'':12s}  {'x':>9s}  {'y':>9s}  {'z':>9s}")
+            print(f"  {'':4s}{'mocap [m]':12s}  {t_m[0]:>+9.4f}  {t_m[1]:>+9.4f}  {t_m[2]:>+9.4f}")
+            print(f"  {'':4s}{'robot [m]':12s}  {t_r[0]:>+9.4f}  {t_r[1]:>+9.4f}  {t_r[2]:>+9.4f}")
+            print(f"  {'':4s}{'Δ [mm]':12s}  {dt_mm[0]:>+9.2f}  {dt_mm[1]:>+9.2f}  {dt_mm[2]:>+9.2f}  (|Δ|={norm_t:.1f} mm)  {flag}")
+            print(f"")
+            print(f"  {'':4s}{'':12s}  {'roll':>9s}  {'pitch':>9s}  {'yaw':>9s}")
+            print(f"  {'':4s}{'mocap [°]':12s}  {rpy_m[0]:>+9.2f}  {rpy_m[1]:>+9.2f}  {rpy_m[2]:>+9.2f}")
+            print(f"  {'':4s}{'robot [°]':12s}  {rpy_r[0]:>+9.2f}  {rpy_r[1]:>+9.2f}  {rpy_r[2]:>+9.2f}")
+            print(f"  {'':4s}{'Δ [°]':12s}  {drpy[0]:>+9.2f}  {drpy[1]:>+9.2f}  {drpy[2]:>+9.2f}  (|Δ|={norm_r:.2f}°)  {flag}")
+
+        print(f"\n{'='*66}")
+        print(f"  Mocap vs Robot — poses relative to base_footprint / tiago_base")
+        print(f"{'='*66}")
+        _print_body(
+            "End effector  (tiago_endEffector ↔ gripper_right_tool_holder)",
+            T_rel_ee_mocap, T_rel_ee_robot,
+        )
+        print(f"\n  {'-'*62}")
+        _print_body(
+            "Pylone  (mocap ↔ pose localisée)",
+            T_rel_pyl_mocap, T_rel_pyl_robot,
+        )
+        print(f"\n{'='*66}\n")
+
+    def localize_pylone_from_mocap(self) -> None:
+        """Set the pylone pose from the current mocap reading.
+
+        Reads the mocap pose of 'pylone' relative to 'tiago_base', converts
+        it to HPP world frame using the current base pose (q_init), updates
+        q_init and saves the result to config/pylone_pose.yaml.
+
+        Call sync_from_robot() first to ensure q_init reflects the current
+        base position.
+        """
+        if not hasattr(self, "_qc"):
+            print("No mocap client — call connect_mocap() first.")
+            return
+
+        T_mocap_base = self._mocap_se3(self._MOCAP_BASE_IDX)
+        T_mocap_pyl  = self._mocap_se3(0)
+        T_rel        = T_mocap_base.inverse() * T_mocap_pyl  # pylone in base frame
+
+        # Convert to HPP world frame
+        T_base_world = self._base_se3_from_q(self.q_init)
+        T_pyl_world  = T_base_world * T_rel
+
+        t    = T_pyl_world.translation.tolist()
+        qpin = pin.Quaternion(T_pyl_world.rotation)
+        q    = [float(qpin.x), float(qpin.y), float(qpin.z), float(qpin.w)]
+
+        self.update_pylone_pose(t, q)
+
+        result = {
+            "pylone_x":    round(t[0], 4),
+            "pylone_y":    round(t[1], 4),
+            "pylone_z":    round(t[2], 4),
+            "pylone_quat": [round(v, 6) for v in q],
+        }
+        with open(_PYLONE_POSE_FILE, "w") as _f:
+            yaml.dump(result, _f, default_flow_style=False)
+        print(f"Pylone pose saved to {_PYLONE_POSE_FILE}")
+
+    def update_mocap_frames(self) -> None:
+        """Display mocap frames for EE and pylone in the Viser viewer.
+
+        On the first call, creates two coordinate-axis frames in the scene:
+          • ``mocap/ee``     — tiago_endEffector pose in HPP world frame
+          • ``mocap/pylone`` — pylone pose in HPP world frame
+
+        Mocap poses (relative to tiago_base) are transformed to HPP world
+        using the current base pose from q_init.  Call sync_from_robot()
+        first if the robot has moved.
+
+        Requires :meth:`connect_mocap` and :meth:`init_viewer` to be called first.
+        """
+        if not hasattr(self, "_qc"):
+            print("No mocap client — call connect_mocap() first.")
+            return
+        if not hasattr(self, "_viewer"):
+            print("No viewer — call init_viewer() first.")
+            return
+
+        T_mocap_base = self._mocap_se3(self._MOCAP_BASE_IDX)
+        T_rel_ee     = T_mocap_base.inverse() * self._mocap_se3(1)  # EE / tiago_base
+        T_rel_pyl    = T_mocap_base.inverse() * self._mocap_se3(0)  # pylone / tiago_base
+
+        # Transform to HPP world frame
+        T_base_world = self._base_se3_from_q(self.q_init)
+        T_ee_world   = T_base_world * T_rel_ee
+        T_pyl_world  = T_base_world * T_rel_pyl
+
+        def _se3_to_viser(T: pin.SE3):
+            pos  = T.translation
+            wxyz = pin.Quaternion(T.rotation).coeffs()[[3, 0, 1, 2]]
+            return pos, wxyz
+
+        viser_server = self._viewer.viewer
+
+        if not hasattr(self, "_mocap_viser_frames"):
+            self._mocap_viser_frames = {
+                "ee": viser_server.scene.add_frame(
+                    "mocap/ee",
+                    show_axes=True, axes_length=0.15, axes_radius=0.006,
+                ),
+                "pylone": viser_server.scene.add_frame(
+                    "mocap/pylone",
+                    show_axes=True, axes_length=0.15, axes_radius=0.006,
+                ),
+            }
+            print("Mocap frames created: 'mocap/ee' and 'mocap/pylone'.")
+
+        pos, wxyz = _se3_to_viser(T_ee_world)
+        self._mocap_viser_frames["ee"].position = pos
+        self._mocap_viser_frames["ee"].wxyz     = wxyz
+
+        pos, wxyz = _se3_to_viser(T_pyl_world)
+        self._mocap_viser_frames["pylone"].position = pos
+        self._mocap_viser_frames["pylone"].wxyz     = wxyz
+
+    # ── Controller activation ─────────────────────────────────────────────────
+
+    def activate_lfc(self) -> None:
+        """Switch arm_right_controller → LFC + JSE. Call this when ready to move."""
+        print("Activating LFC controllers …")
+        subprocess.run(
+            [
+                "ros2", "control", "switch_controllers",
+                "--deactivate", "arm_right_controller",
+                "--activate",
+                "linear_feedback_controller",
+                "joint_state_estimator",
+            ],
+            check=True,
+        )
+        print("LFC controllers active.")
+
+    def deactivate_lfc(self) -> None:
+        """Switch LFC + JSE → arm_right_controller."""
+        print("Deactivating LFC controllers …")
+        subprocess.run(
+            [
+                "ros2", "control", "switch_controllers",
+                "--deactivate",
+                "linear_feedback_controller",
+                "joint_state_estimator",
+                "--activate", "arm_right_controller",
+            ],
+            check=True,
+        )
+        print("arm_right_controller active.")
 
     # ── Combined ──────────────────────────────────────────────────────────────
 

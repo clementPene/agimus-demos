@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<robot name="pylone">
+<robot name="pylone" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
   <material name="grey">
     <color rgba="0.0 0.9 0.9 1.0"/>
@@ -8,14 +8,14 @@
   <link name="pylone_link">
     <visual>
       <geometry>
-        <mesh filename="package://agimus_demo_07_tiago_pro_deburring/urdf/visual/pylone.stl"
+        <mesh filename="file://$(find agimus_demo_07_tiago_pro_deburring)/urdf/visual/pylone.stl"
               scale="1.0 1.0 1.0"/>
       </geometry>
       <material name="grey"/>
     </visual>
     <collision>
       <geometry>
-        <mesh filename="package://agimus_demo_07_tiago_pro_deburring/urdf/collision/pylone.stl"
+        <mesh filename="file://$(find agimus_demo_07_tiago_pro_deburring)/urdf/collision/pylone.stl"
               scale="1.0 1.0 1.0"/>
       </geometry>
     </collision>
@@ -25,5 +25,9 @@
       <inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/>
     </inertial>
   </link>
+
+  <gazebo>
+    <static>true</static>
+  </gazebo>
 
 </robot>

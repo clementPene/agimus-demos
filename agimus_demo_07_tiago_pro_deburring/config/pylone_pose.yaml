@@ -1,0 +1,9 @@
+# Pylone pose in HPP world frame.
+# Updated by o.localize_pylone_from_mocap() or scripts/localize_pylone.py.
+# For the full-body demo, this is expressed in the HPP world frame (NOT base_link).
+# Call o.sync_from_robot() before o.localize_pylone_from_mocap() to ensure
+# the base pose in q_init is up to date.
+pylone_x: 1.5
+pylone_y: 0.0
+pylone_z: 1.03
+pylone_quat: [0.0, 0.0, 0.0, 1.0]

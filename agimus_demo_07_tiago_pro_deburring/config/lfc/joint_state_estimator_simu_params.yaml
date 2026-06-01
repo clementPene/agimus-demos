@@ -1,0 +1,88 @@
+---
+# JSE simulation params for demo 07 (TIAGo Pro full body — planar base + right arm).
+# Compared to agimus_demos_common, adds base_odom/* state interfaces (from
+# odometry_gz_hw_interface) and the corresponding base command interfaces forwarded
+# to the linear_feedback_controller (needed when robot_has_free_flyer: true).
+joint_state_estimator:
+  ros__parameters:
+    type: linear_feedback_controller/JointStateEstimator
+    state_interfaces: [
+      base_odom/position.x,
+      base_odom/position.y,
+      base_odom/position.z,
+      base_odom/orientation.x,
+      base_odom/orientation.y,
+      base_odom/orientation.z,
+      base_odom/orientation.w,
+
+      arm_right_1_joint/position,
+      arm_right_2_joint/position,
+      arm_right_3_joint/position,
+      arm_right_4_joint/position,
+      arm_right_5_joint/position,
+      arm_right_6_joint/position,
+      arm_right_7_joint/position,
+
+      base_odom/linear_velocity.x,
+      base_odom/linear_velocity.y,
+      base_odom/linear_velocity.z,
+      base_odom/angular_velocity.x,
+      base_odom/angular_velocity.y,
+      base_odom/angular_velocity.z,
+
+      arm_right_1_joint/velocity,
+      arm_right_2_joint/velocity,
+      arm_right_3_joint/velocity,
+      arm_right_4_joint/velocity,
+      arm_right_5_joint/velocity,
+      arm_right_6_joint/velocity,
+      arm_right_7_joint/velocity,
+
+      arm_right_1_joint/effort,
+      arm_right_2_joint/effort,
+      arm_right_3_joint/effort,
+      arm_right_4_joint/effort,
+      arm_right_5_joint/effort,
+      arm_right_6_joint/effort,
+      arm_right_7_joint/effort
+      ]
+    command_interfaces: [
+      linear_feedback_controller/base_translation_x,
+      linear_feedback_controller/base_translation_y,
+      linear_feedback_controller/base_translation_z,
+      linear_feedback_controller/base_orientation_qx,
+      linear_feedback_controller/base_orientation_qy,
+      linear_feedback_controller/base_orientation_qz,
+      linear_feedback_controller/base_orientation_qw,
+
+      linear_feedback_controller/arm_right_1_joint/position,
+      linear_feedback_controller/arm_right_2_joint/position,
+      linear_feedback_controller/arm_right_3_joint/position,
+      linear_feedback_controller/arm_right_4_joint/position,
+      linear_feedback_controller/arm_right_5_joint/position,
+      linear_feedback_controller/arm_right_6_joint/position,
+      linear_feedback_controller/arm_right_7_joint/position,
+
+      linear_feedback_controller/base_linear_velocity_x,
+      linear_feedback_controller/base_linear_velocity_y,
+      linear_feedback_controller/base_linear_velocity_z,
+      linear_feedback_controller/base_angular_velocity_x,
+      linear_feedback_controller/base_angular_velocity_y,
+      linear_feedback_controller/base_angular_velocity_z,
+
+      linear_feedback_controller/arm_right_1_joint/velocity,
+      linear_feedback_controller/arm_right_2_joint/velocity,
+      linear_feedback_controller/arm_right_3_joint/velocity,
+      linear_feedback_controller/arm_right_4_joint/velocity,
+      linear_feedback_controller/arm_right_5_joint/velocity,
+      linear_feedback_controller/arm_right_6_joint/velocity,
+      linear_feedback_controller/arm_right_7_joint/velocity,
+
+      linear_feedback_controller/arm_right_1_joint/effort,
+      linear_feedback_controller/arm_right_2_joint/effort,
+      linear_feedback_controller/arm_right_3_joint/effort,
+      linear_feedback_controller/arm_right_4_joint/effort,
+      linear_feedback_controller/arm_right_5_joint/effort,
+      linear_feedback_controller/arm_right_6_joint/effort,
+      linear_feedback_controller/arm_right_7_joint/effort
+      ]

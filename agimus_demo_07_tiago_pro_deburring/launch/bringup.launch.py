@@ -6,6 +6,7 @@ Usage:
     ros2 launch agimus_demo_07_tiago_pro_deburring bringup.launch.py use_gazebo:=true use_hpp_bridge:=true
 """
 
+import math
 import os
 import yaml
 
@@ -20,6 +21,8 @@ from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
 from launch.launch_description_entity import LaunchDescriptionEntity
 from launch.substitutions import (
+    Command,
+    FindExecutable,
     LaunchConfiguration,
     PathJoinSubstitution,
 )
@@ -35,19 +38,29 @@ from agimus_demos_common.mpc_debugger_node import mpc_debugger_node
 
 PKG = "agimus_demo_07_tiago_pro_deburring"
 
-_cfg_path = os.path.join(
-    os.path.dirname(__file__), "..", "config", "hpp_orchestrator_params.yaml"
+# ── Pylone pose (HPP world frame = Gazebo world frame when robot starts at origin)
+_pylone_pose_path = os.path.join(
+    os.path.dirname(__file__), "..", "config", "pylone_pose.yaml"
 )
-with open(_cfg_path) as _f:
-    _cfg = yaml.safe_load(_f)
+with open(_pylone_pose_path) as _f:
+    _pp = yaml.safe_load(_f)
 
-_s = _cfg["scene"]
-TABLE_X = _s["table_x"]
-TABLE_Y = _s["table_y"]
-TABLE_Z = _s["table_z"]
-PYLONE_X = TABLE_X
-PYLONE_Y = TABLE_Y
-PYLONE_Z = _s["pylone_z_offset"]
+PYLONE_X = _pp["pylone_x"]
+PYLONE_Y = _pp["pylone_y"]
+PYLONE_Z = _pp["pylone_z"]
+
+
+def _quat_to_rpy(q):
+    """Convert quaternion [qx, qy, qz, qw] to roll/pitch/yaw for Gazebo spawn."""
+    qx, qy, qz, qw = q
+    roll  = math.atan2(2 * (qw * qx + qy * qz), 1 - 2 * (qx * qx + qy * qy))
+    pitch = math.asin(2 * (qw * qy - qz * qx))
+    yaw   = math.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
+    return roll, pitch, yaw
+
+
+_quat = _pp.get("pylone_quat", [0.0, 0.0, 0.0, 1.0])
+PYLONE_ROLL, PYLONE_PITCH, PYLONE_YAW = _quat_to_rpy(_quat)
 
 
 def launch_setup(
@@ -56,7 +69,17 @@ def launch_setup(
 
     tiago_robot_launch = generate_include_launch(
         "tiago_pro_common.launch.py",
-        extra_launch_arguments={"tuck_arm": "False"},
+        extra_launch_arguments={
+            "tuck_arm": "False",
+            "end_effector_right": "pal-atc",
+            "end_effector_left": "pal-pro-gripper",
+            # Use demo-07-specific LFC/JSE params that enable robot_has_free_flyer:
+            # true so the MPC receives the actual base pose/twist from odometry.
+            "lfc_pkg": PKG,
+            "lfc_yaml": "config/lfc/linear_feedback_controller_simu_params.yaml",
+            "jse_yaml": "config/lfc/joint_state_estimator_simu_params.yaml",
+            "pc_yaml": "config/lfc/dummy_controllers.yaml",
+        },
     )
 
     wait_for_non_zero_joints_node = Node(
@@ -101,26 +124,24 @@ def launch_setup(
         output="screen",
     )
 
-    spawn_table_node = Node(
-        package="ros_gz_sim",
-        executable="create",
-        arguments=[
-            "-name", "table",
-            "-file", PathJoinSubstitution([FindPackageShare(PKG), "urdf", "table.urdf"]),
-            "-x", str(TABLE_X), "-y", str(TABLE_Y), "-z", str(TABLE_Z),
-        ],
-        output="screen",
-    )
-
     spawn_pylone_node = Node(
         package="ros_gz_sim",
         executable="create",
         arguments=[
             "-name", "pylone",
-            "-file", PathJoinSubstitution([FindPackageShare(PKG), "urdf", "pylone.urdf"]),
-            "-x", str(PYLONE_X), "-y", str(PYLONE_Y), "-z", str(PYLONE_Z),
+            "-string", Command([
+                FindExecutable(name="xacro"), " ",
+                PathJoinSubstitution([FindPackageShare(PKG), "urdf", "pylone.urdf.xacro"]),
+            ]),
+            "-x", str(PYLONE_X),
+            "-y", str(PYLONE_Y),
+            "-z", str(PYLONE_Z),
+            "-R", str(PYLONE_ROLL),
+            "-P", str(PYLONE_PITCH),
+            "-Y", str(PYLONE_YAW),
         ],
         output="screen",
+        condition=IfCondition(LaunchConfiguration("use_gazebo")),
     )
 
     mpc_debugger = mpc_debugger_node(
@@ -152,7 +173,6 @@ def launch_setup(
 
     return [
         tiago_robot_launch,
-        spawn_table_node,
         spawn_pylone_node,
         wait_for_non_zero_joints_node,
         environment_publisher_node,
