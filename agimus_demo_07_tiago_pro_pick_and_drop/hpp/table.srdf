@@ -1,0 +1,17 @@
+<!-- Table contact surface for HPP.
+     The table_top_link is a 1.0 x 2.0 x 0.025 m box.
+     Top surface = link origin + z_offset = 0.7325 + 0.0125 = 0.745 m in world frame.
+     Contact points are expressed in the table_top_link frame (+z = up). -->
+<robot name="table">
+  <contact name="surface">
+    <link name="table_top_link"/>
+    <!-- Four corners of the top face in table_top_link frame -->
+    <point>
+       0.5 -1.0  0.0125
+       0.5  1.0  0.0125
+      -0.5  1.0  0.0125
+      -0.5 -1.0  0.0125
+    </point>
+    <shape>4 0 1 2 3</shape>
+  </contact>
+</robot>

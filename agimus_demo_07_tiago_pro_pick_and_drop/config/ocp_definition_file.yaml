@@ -1,0 +1,89 @@
+---
+# OCP definition for the TIAGo Pro pick-and-drop demo.
+# Task-space priority: frame tracking dominates, state_reg is a first guess only.
+
+running_model:
+  class: IntegratedActionModelEuler
+  differential:
+    class: DifferentialActionModelFreeFwdDynamics
+    costs:
+    - name: state_reg
+      update: true
+      weight: 1.0
+      cost:
+        class: CostModelResidual
+        activation:
+          class: ActivationModelWeightedQuad
+          weights: 1.0
+        residual:
+          class: ResidualModelState
+    - name: control_reg
+      update: true
+      weight: 1.0
+      cost:
+        class: CostModelResidual
+        activation:
+          class: ActivationModelWeightedQuad
+          weights: 1.0
+        residual:
+          class: ResidualModelControl
+    - name: frame_trans_tracking_tool
+      update: true
+      weight: 1.0
+      cost:
+        class: CostModelResidual
+        activation:
+          class: ActivationModelWeightedQuad
+          weights: 1.0
+        residual:
+          class: ResidualModelFrameTranslationStatic
+          frame_id: arm_left_tool_link
+    - name: frame_rot_tracking_tool
+      update: true
+      weight: 1.0
+      cost:
+        class: CostModelResidual
+        activation:
+          class: ActivationModelWeightedQuad
+          weights: 1.0
+        residual:
+          class: ResidualModelFrameRotationStatic
+          frame_id: arm_left_tool_link
+
+terminal_model:
+  class: IntegratedActionModelEuler
+  differential:
+    class: DifferentialActionModelFreeFwdDynamics
+    costs:
+    - name: state_reg
+      update: true
+      weight: 1.0
+      cost:
+        class: CostModelResidual
+        activation:
+          class: ActivationModelWeightedQuad
+          weights: 1.0
+        residual:
+          class: ResidualModelState
+    - name: frame_trans_tracking_tool
+      update: true
+      weight: 1.0
+      cost:
+        class: CostModelResidual
+        activation:
+          class: ActivationModelWeightedQuad
+          weights: 1.0
+        residual:
+          class: ResidualModelFrameTranslationStatic
+          frame_id: arm_left_tool_link
+    - name: frame_rot_tracking_tool
+      update: true
+      weight: 1.0
+      cost:
+        class: CostModelResidual
+        activation:
+          class: ActivationModelWeightedQuad
+          weights: 1.0
+        residual:
+          class: ResidualModelFrameRotationStatic
+          frame_id: arm_left_tool_link

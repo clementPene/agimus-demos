@@ -1,0 +1,26 @@
+---
+# MPC parameters for the TIAGo Pro pick-and-drop demo (fixed base, left arm only).
+#
+# State space: nq = 7, nv = 7 (left arm joints only)
+
+agimus_controller_node:
+  ros__parameters:
+    rate: 100.0
+    free_flyer: false
+    ocp:
+      dt: 0.01
+      horizon_size: 50
+      dt_factor_n_seq:
+        n_steps: [50]
+        factors: [1]
+      armature: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+      max_qp_iter: 50
+      max_iter: 5
+      activate_callback: false
+      effector_frame_name: arm_left_tool_link
+      definition_yaml_file: package://agimus_demo_07_tiago_pro_pick_and_drop/config/ocp_definition_file.yaml
+    robot_attachment_frame: universe
+    collision_pairs_names: [cp_1]
+    cp_1:
+      first: gripper_left_base_finger_left_link_0
+      second: gripper_right_base_finger_left_link_0

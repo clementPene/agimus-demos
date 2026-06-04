@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>agimus_demo_07_tiago_pro_pick_and_drop</name>
+  <version>0.0.0</version>
+  <description>
+    Pick-and-drop demo for TIAGo Pro with fixed base (left arm only, 7 DOF, pal-pro-gripper).
+    The robot picks a T-LESS object (obj_23) from a table at 74.5 cm height,
+    carries it to a drop zone, and releases it. Only the left arm is actuated.
+  </description>
+  <maintainer email="gepetto@laas.fr">Gepetto Team</maintainer>
+  <license>BSD-2</license>
+  <url type="website">https://www.agimus-project.eu/</url>
+  <url type="repository">https://github.com/agimus-project/agimus-demos</url>
+  <url type="bugtracker">https://github.com/agimus-project/agimus-demos/issues</url>
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
+  <exec_depend>agimus_demos_common</exec_depend>
+  <exec_depend>agimus_demo_05_pick_and_place</exec_depend>
+  <exec_depend>control_msgs</exec_depend>
+  <exec_depend>linear_feedback_controller</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>trajectory_msgs</exec_depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

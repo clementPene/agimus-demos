@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- T-LESS object 23 (industrial multisocket plug).
+     Mesh sourced from agimus_demo_05_pick_and_place.
+     Collision approximated by a tight bounding box (100 x 40 x 40 mm). -->
+<robot name="obj_000023">
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <mesh filename="package://agimus_demo_07_tiago_pro_pick_and_drop/urdf/obj_23.obj"/>
+      </geometry>
+      <material name="tless_magenta">
+        <color rgba="0.9 0.0 0.9 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <!-- Bounding box: 100 mm (x) × 40 mm (y) × 40 mm (z) -->
+      <geometry>
+        <box size="0.100 0.040 0.040"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.1"/>
+      <inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-4"/>
+    </inertial>
+  </link>
+</robot>

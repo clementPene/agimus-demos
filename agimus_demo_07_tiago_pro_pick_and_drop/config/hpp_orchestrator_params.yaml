@@ -1,0 +1,59 @@
+---
+# HPP orchestrator parameters for the TIAGo Pro pick-and-drop demo (fixed base).
+#
+# State space (nv=7): 7 left arm joints.
+# Config space (nq=7+7=14 without freeflyer; object adds 7 DOF).
+
+# ── Trajectory sampling ───────────────────────────────────────────────────────
+trajectory:
+  dt: 0.01          # sampling period (s) — must match agimus_controller rate
+  time_scale: 1.6   # stretch HPP path time further so the arm settles with less overshoot while keeping the same final pose
+  carry_time_scale: 1.0   # keep the long transport phase closer to nominal timing so p3 does not drag in Gazebo
+
+# ── Configurable T-LESS object ───────────────────────────────────────────────
+# Shipped object assets: obj_01, obj_20, obj_21, obj_22, obj_23, obj_23,
+# obj_26, obj_31.
+object:
+  name: "obj_23"
+  # The orchestrator resolves the URDF/SRDF from object.name.
+  # Bare resource names are auto-qualified to <object.name>/... inside HPP.
+  link: "base_link"
+  # All shipped object SRDFs expose goal_handle_up for the default aligned grasp.
+  # Override with an object-specific alternative handle if needed.
+  handle_name: "goal_handle_up"
+  handle_clearance: 0.05
+  # Object centre position in robot base_link frame.
+  # Table is 0.5 m in front of robot; object centered on table.
+  # Update z when switching object if its base_link origin sits at a different
+  # height relative to the support surface.
+  x: 0.55
+  y: 0.0
+  z: 0.768   # 0.745 + 0.023
+
+# ── Arm tuck configurations (same as demo_07_fixed) ──────────────────────────
+tuck:
+  left_arm:  [2.8, -1.81, -0.56, -2.20, -2.6, 0.91, -0.26]
+  right_arm: [-2.8, -1.81, 0.56, -2.20, 2.6, 0.91, 0.26]
+
+# ── Drop-zone arm configuration ───────────────────────────────────────────────
+# Joint values for arm_left_1 … arm_left_7 where the gripper hovers above
+# the drop zone.  Adjust for your specific setup.
+drop:
+  arm_config: [2.8, -1.81, -0.56, -2.20, -2.6, 0.91, -0.26]
+
+# ── MPC weights ───────────────────────────────────────────────────────────────
+weights:
+  w_q:           [0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12]         # keep the arm closer to the planned IK posture so it does not hunt in redundant joint space
+  w_qdot:        [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]         # increase velocity damping so contact and final settling are less oscillatory
+  w_qddot:       [0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08]         # penalize sharp acceleration reversals that show up as vibration
+  w_effort:      [0.006, 0.006, 0.006, 0.006, 0.006, 0.006, 0.006]  # limit corrective torque spikes while keeping the end-effector target precise
+  w_collision:   0.0
+  w_frame_trans: [1000.0, 1000.0, 1000.0]                               # tighten translational alignment so the gripper lands closer to the planned grasp pose
+  w_frame_rot:   [60.0, 60.0, 60.0]                                  # keep wrist alignment firm without driving small orientation oscillations
+  # w_q:           [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
+  # w_qdot:        [0.01,  0.01,  0.01,  0.01,  0.01,  0.01,  0.01 ]
+  # w_qddot:       [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
+  # w_effort:      [0.01,   0.01,   0.01,   0.01,   0.01,   0.01,   0.01  ]
+  # w_collision:   0.0
+  # w_frame_trans: [10000.0, 10000.0, 10000.0]
+  # w_frame_rot:   [5.0, 5.0, 5.0]
