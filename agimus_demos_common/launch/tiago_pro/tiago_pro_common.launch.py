@@ -40,8 +40,12 @@ def launch_setup(
     use_gazebo = LaunchConfiguration("use_gazebo")
     use_rviz = LaunchConfiguration("use_rviz")
     rviz_config_path = LaunchConfiguration("rviz_config_path")
+    active_arm_side = LaunchConfiguration("active_arm_side")
 
     use_gazebo_bool = context.perform_substitution(use_gazebo).lower() == "true"
+    active_arm_controller = (
+        f"arm_{context.perform_substitution(active_arm_side)}_controller"
+    )
 
     lfc_controllers = [
         "linear_feedback_controller",
@@ -153,7 +157,7 @@ def launch_setup(
                 "control",
                 "switch_controllers",
                 "--deactivate",
-                "arm_right_controller",
+                active_arm_controller,
                 "--activate",
             ]
             + passthrough_controllers

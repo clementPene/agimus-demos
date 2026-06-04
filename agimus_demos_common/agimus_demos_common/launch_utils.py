@@ -403,6 +403,12 @@ def generate_default_tiago_pro_args() -> list[DeclareLaunchArgument]:
             default_value="True",
         ),
         DeclareLaunchArgument(
+            "active_arm_side",
+            default_value="right",
+            choices=["left", "right"],
+            description="Arm side controlled by the LFC/JSE stack.",
+        ),
+        DeclareLaunchArgument(
             "lfc_pkg",
             default_value="agimus_demos_common",
             description="Package containing the LFC/JSE/passthrough config files for simulation.",
