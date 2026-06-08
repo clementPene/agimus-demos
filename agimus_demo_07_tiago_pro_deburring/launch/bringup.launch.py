@@ -73,12 +73,6 @@ def launch_setup(
             "tuck_arm": "False",
             "end_effector_right": "pal-atc",
             "end_effector_left": "pal-pro-gripper",
-            # Use demo-07-specific LFC/JSE params that enable robot_has_free_flyer:
-            # true so the MPC receives the actual base pose/twist from odometry.
-            "lfc_pkg": PKG,
-            "lfc_yaml": "config/lfc/linear_feedback_controller_simu_params.yaml",
-            "jse_yaml": "config/lfc/joint_state_estimator_simu_params.yaml",
-            "pc_yaml": "config/lfc/dummy_controllers.yaml",
         },
     )
 
@@ -116,10 +110,10 @@ def launch_setup(
         output="screen",
     )
 
-    base_cmd_bridge_node = Node(
+    base_trajectory_follower_node = Node(
         package=PKG,
-        executable="base_cmd_bridge",
-        name="base_cmd_bridge",
+        executable="base_trajectory_follower",
+        name="base_trajectory_follower",
         parameters=[get_use_sim_time()],
         output="screen",
     )
@@ -182,7 +176,7 @@ def launch_setup(
                 target_action=wait_for_non_zero_joints_node,
                 on_exit=[
                     agimus_controller_node,
-                    base_cmd_bridge_node,
+                    base_trajectory_follower_node,
                     hpp_bridge_node,
                 ],
             )

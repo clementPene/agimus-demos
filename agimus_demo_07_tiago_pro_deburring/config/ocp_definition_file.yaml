@@ -1,5 +1,5 @@
 ---
-# OCP definition for the TIAGo Pro deburring demo (full body).
+# OCP definition for the TIAGo Pro deburring demo (fixed-base, right arm only).
 # Task-space priority: frame tracking dominates, state_reg is a first guess only.
 
 running_model:
@@ -49,6 +49,15 @@ running_model:
         residual:
           class: ResidualModelFrameRotationStatic
           frame_id: gripper_right_tool_holder
+    constraints:
+    - name: control_limits
+      constraint:
+        class: ConstraintModelResidual
+        active_on_terminal_node: false
+        lower: [-43.0, -43.0, -26.0, -26.0, -26.0, -26.0, -26.0]
+        upper: [ 43.0,  43.0,  26.0,  26.0,  26.0,  26.0,  26.0]
+        residual:
+          class: ResidualModelControl
 
 terminal_model:
   class: IntegratedActionModelEuler

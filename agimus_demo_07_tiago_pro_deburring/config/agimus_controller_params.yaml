@@ -1,21 +1,20 @@
 ---
 # MPC parameters for the TIAGo Pro deburring demo.
 #
-# State space:
-#   nq = 4 (x, y, cos(yaw), sin(yaw)) + 7 (right arm) = 11
-#   nv = 3 (vx, vy, omega)            + 7 (right arm) = 10
+# State space (nv=7): 7 right arm joints
+# Config space (nq=7): 7 right arm joints
 
 agimus_controller_node:
   ros__parameters:
     rate: 100.0
-    planar_base: true
+    planar_base: false
     ocp:
       dt: 0.01
       horizon_size: 50
       dt_factor_n_seq:
         n_steps: [50]
         factors: [1]
-      armature: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+      armature: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
       max_qp_iter: 50
       max_iter: 5
       activate_callback: false
