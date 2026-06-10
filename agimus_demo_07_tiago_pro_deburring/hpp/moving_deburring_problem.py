@@ -37,11 +37,7 @@ _CFG_FILE = os.path.join(_PKG_DIR, "config", "hpp_orchestrator_params.yaml")
 with open(_CFG_FILE) as _f:
     _cfg = yaml.safe_load(_f)
 
-_h           = _cfg["handle"]
-HANDLE_LINK  = _h["link"]
-HANDLE_NAME  = _h["name"]
-HANDLE_POS   = np.array(_h["position"])
-HANDLE_CLEAR = _h["clearance"]
+HANDLE_NAME = _cfg["handle"]["name"]
 
 LEFT_ARM_TUCK  = _cfg["tuck"]["left_arm"]
 RIGHT_ARM_TUCK = _cfg["tuck"]["right_arm"]
@@ -110,14 +106,18 @@ class DeburringProblem:
 
         self._set_pylone_bounds(_px, _py, _pz)
 
-        _R = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]])
-        robot.addHandle(
-            HANDLE_LINK, HANDLE_NAME,
-            pin.SE3(_R, HANDLE_POS),
-            HANDLE_CLEAR,
-            6 * [True],
-        )
-        robot.handles()[HANDLE_NAME].approachingDirection = np.array([0, 0, 1])
+        _handle = robot.handles()[HANDLE_NAME]
+        # Align our handle Z with the SRDF handle X (insertion axis),
+        # so that EE Z = insertion direction for any handle choice.
+        _srdf_x = _handle.localPosition.rotation[:, 0]
+        _z = _srdf_x / np.linalg.norm(_srdf_x)
+        _tmp = np.array([1., 0., 0.]) if abs(_z[0]) < 0.9 else np.array([0., 1., 0.])
+        _y = np.cross(_z, _tmp); _y /= np.linalg.norm(_y)
+        _x = np.cross(_y, _z)
+        _R = np.column_stack([_x, _y, _z])
+        _handle.localPosition = pin.SE3(_R, _handle.localPosition.translation)
+        _handle.mask = [True, True, True, True, True, True]
+        _handle.approachingDirection = np.array([0, 0, 1])
 
         li = self.left_arm_idx
         ri = self.right_arm_idx
@@ -203,7 +203,7 @@ class DeburringProblem:
         graph.addNumericalConstraintsToGraph(locked)
 
         sm = SecurityMargins(problem, factory, ["tiago_pro", "pylone"], robot)
-        sm.setSecurityMarginBetween("tiago_pro", "pylone", 0.05)
+        sm.setSecurityMarginBetween("tiago_pro", "pylone", 0.02)
         sm.apply()
 
         for jname in model.names:

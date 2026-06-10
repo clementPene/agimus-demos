@@ -173,7 +173,7 @@ class Orchestrator:
 
     # ── Planning ──────────────────────────────────────────────────────────────
 
-    def plan(self, max_attempts: int = 50) -> bool:
+    def plan(self, max_attempts: int = 50000) -> bool:
         """Plan p1 (approach, base free), p2 (insertion, base fixed), p3 (retraction).
         Call sync_from_robot() first if needed."""
         prob = self._prob
@@ -202,9 +202,11 @@ class Orchestrator:
             print(f"Failed to find collision-free qpg in {max_attempts} attempts.")
             return False
 
+        self.qpg = qpg
+
         prob.problem.constraintGraph(prob.graph)
         planner    = TransitionPlanner(prob.problem)
-        planner.maxIterations(1000)
+        planner.maxIterations(5000)
         shortcut   = RandomShortcut(prob.problem)
         spline_opt = SplineGradientBased_bezier3(prob.problem)
 
