@@ -18,9 +18,10 @@ object:
   # The orchestrator resolves the URDF/SRDF from object.name.
   # Bare resource names are auto-qualified to <object.name>/... inside HPP.
   link: "base_link"
-  # All shipped object SRDFs expose goal_handle_up for the default aligned grasp.
-  # Override with an object-specific alternative handle if needed.
-  handle_name: "goal_handle_up"
+  # Grasp candidates come straight from whatever handles are defined in the
+  # object's SRDF (see obj_23.srdf's goal_handle_up/goal_handle_down) — the
+  # planner tries each one and picks whichever actually plans, so this needs
+  # no per-object handle list here. This generalizes to any T-LESS object.
   handle_clearance: 0.05
   # Object centre position in robot base_link frame.
   # Table is 0.5 m in front of robot; object centered on table.

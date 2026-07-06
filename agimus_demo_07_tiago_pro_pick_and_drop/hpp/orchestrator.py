@@ -85,12 +85,6 @@ def _happypose_class_id(obj_name: str, dataset: str) -> str:
     return f"{dataset}-obj_{int(num_part):06d}"
 
 
-def _qualify_object_resource_name(name: str) -> str:
-    if "/" in name:
-        return name
-    return f"{OBJ_NAME}/{name}"
-
-
 def _resolve_object_asset_path(base_dir: str, extension: str) -> str:
     object_basename = OBJ_NAME.rsplit("/", 1)[-1]
     path = os.path.join(base_dir, f"{object_basename}{extension}")
@@ -110,7 +104,6 @@ def _resolve_object_asset_path(base_dir: str, extension: str) -> str:
 
 OBJ_SRDF    = _resolve_object_asset_path(_HPP_DIR, ".srdf")
 OBJ_URDF    = _resolve_object_asset_path(os.path.join(_PKG_DIR, "urdf"), ".urdf")
-HANDLE_NAME = _qualify_object_resource_name(_obj_cfg.get("handle_name", "goal_handle_up"))
 OBJ_INIT_POS = np.array([_obj_cfg["x"], _obj_cfg["y"], _obj_cfg["z"]])
 
 LEFT_ARM_TUCK  = _cfg["tuck"]["left_arm"]
@@ -509,6 +502,14 @@ class Orchestrator:
         model = robot.model()
         self.model = model
 
+        # Grasp candidates come straight from whatever handles are defined
+        # in the object's SRDF, so this works unmodified for any T-LESS
+        # object — no per-object handle list to maintain in config.
+        self._handle_names = sorted(
+            entry.key() for entry in robot.handles()
+            if entry.key().startswith(f"{OBJ_NAME}/")
+        )
+
         def _idx(name):
             joint_name = self._resolve_joint_name(name)
             return model.joints[model.getJointId(joint_name)].idx_q
@@ -591,22 +592,38 @@ class Orchestrator:
         graph.maxIterations(40)
         graph.errorThreshold(1e-3)
         factory.setGrippers([self._gripper_name])
-        factory.setObjects([OBJ_NAME], [[HANDLE_NAME]], [[]])
+        factory.setObjects([OBJ_NAME], [self._handle_names], [[]])
         factory.generate()
 
-        gripper   = self._gripper_name
-        handle    = HANDLE_NAME
+        gripper = self._gripper_name
 
-        self._transition_approach = graph.getTransition(
-            f"{gripper} > {handle} | f_01"
-        )
-        self._transition_grasp = graph.getTransition(
-            f"{gripper} > {handle} | f_12"
-        )
-        # Loop edge at grasped state — used for the carry phase.
-        self._transition_carry = self._find_carry_edge(graph, self._transition_grasp)
-        # Reverse edge from grasped back to pre-grasp — used for release at drop zone.
-        self._transition_release = self._find_release_edge(graph, self._transition_grasp)
+        # One (approach, grasp, carry, release) transition quadruple per
+        # handle. Vision can't tell us which handle is actually reachable
+        # (e.g. the object detected flipped ~180 deg), so plan() tries each
+        # candidate and picks whichever one actually plans — see
+        # _select_best_handle().
+        self._grasp_candidates = []
+        for handle in self._handle_names:
+            transition_approach = graph.getTransition(f"{gripper} > {handle} | f_01")
+            transition_grasp = graph.getTransition(f"{gripper} > {handle} | f_12")
+            self._grasp_candidates.append({
+                "name": handle,
+                "approach": transition_approach,
+                "grasp": transition_grasp,
+                # Loop edge at grasped state — used for the carry phase.
+                "carry": self._find_carry_edge(graph, transition_grasp),
+                # Reverse edge from grasped back to pre-grasp — used for
+                # release at drop zone.
+                "release": self._find_release_edge(graph, transition_grasp),
+            })
+
+        # Default to the first candidate; _select_best_handle() (called from
+        # plan()) overrides this once actual reachability is known.
+        default = self._grasp_candidates[0]
+        self._transition_approach = default["approach"]
+        self._transition_grasp    = default["grasp"]
+        self._transition_carry    = default["carry"]
+        self._transition_release  = default["release"]
 
         _cts = ComparisonTypes()
         _cts[:] = [ComparisonType.EqualToZero]
@@ -637,12 +654,14 @@ class Orchestrator:
         sm.apply()
 
         # Disable collision between robot and object in grasp/carry transitions
-        # so the gripper can actually reach the handle.
-        if self._transition_grasp is not None:
+        # so the gripper can actually reach the handle — for every handle.
+        for cand in self._grasp_candidates:
+            if cand["grasp"] is None:
+                continue
             for jname in model.names:
                 if jname and "/" not in jname:
                     graph.setSecurityMarginForTransition(
-                        self._transition_grasp, jname,
+                        cand["grasp"], jname,
                         f"{OBJ_NAME}/root_joint", float("-inf"),
                     )
 
@@ -770,6 +789,27 @@ class Orchestrator:
         )
         return path
 
+    def _sample_grasp_candidate(
+        self, approach_transition, grasp_transition,
+        shooter, approach_validator, grasp_validator,
+    ):
+        """Try one random sample against a given (approach, grasp) transition
+        pair. Returns (ok, qpg, qg, err, qg_err); ok is False (with the rest
+        None) if the pre-grasp/grasp config couldn't be generated or is in
+        collision — no path planning is attempted here."""
+        q = shooter.shoot()
+        res, qpg, err = self.graph.generateTargetConfig(
+            approach_transition, self.q_init, q
+        )
+        if not res or not approach_validator.validateConfiguration(qpg)[0]:
+            return False, None, None, None, None
+
+        res, qg, qg_err = self.graph.generateTargetConfig(grasp_transition, qpg, qpg)
+        if not res or not grasp_validator.validateConfiguration(qg)[0]:
+            return False, None, None, None, None
+
+        return True, qpg, qg, err, qg_err
+
     def _find_approach_path(self, planner, q_goal, max_attempts: int):
         shooter = self.problem.configurationShooter()
         approach_validator = self._transition_approach.pathValidation()
@@ -778,17 +818,11 @@ class Orchestrator:
         search_start = time.perf_counter()
 
         for attempt in range(max_attempts):
-            q = shooter.shoot()
-            res, qpg, err = self.graph.generateTargetConfig(
-                self._transition_approach, self.q_init, q
+            ok, qpg, qg, err, qg_err = self._sample_grasp_candidate(
+                self._transition_approach, self._transition_grasp,
+                shooter, approach_validator, grasp_validator,
             )
-            if not res or not approach_validator.validateConfiguration(qpg)[0]:
-                continue
-
-            res, qg, qg_err = self.graph.generateTargetConfig(
-                self._transition_grasp, qpg, qpg
-            )
-            if not res or not grasp_validator.validateConfiguration(qg)[0]:
+            if not ok:
                 continue
 
             valid_candidate_count += 1
@@ -876,6 +910,35 @@ class Orchestrator:
 
         return p3, p4
 
+    def _select_best_handle(self, trial_attempts: int = 30) -> None:
+        """Try every candidate handle (see _setup_graph) with a small budget
+        of IK/collision-only samples (no path planning) and switch
+        self._transition_* to whichever handle is actually reachable —
+        vision can't tell us which one is (e.g. the object may be detected
+        flipped ~180 deg), so this decides based on observed success rate
+        instead of assuming a single canonical orientation."""
+        shooter = self.problem.configurationShooter()
+        scores = []
+        for cand in self._grasp_candidates:
+            approach_validator = cand["approach"].pathValidation()
+            grasp_validator = cand["grasp"].pathValidation()
+            successes = sum(
+                self._sample_grasp_candidate(
+                    cand["approach"], cand["grasp"],
+                    shooter, approach_validator, grasp_validator,
+                )[0]
+                for _ in range(trial_attempts)
+            )
+            scores.append(successes)
+            print(f"  Handle '{cand['name']}': {successes}/{trial_attempts} reachable samples.")
+
+        chosen = self._grasp_candidates[scores.index(max(scores))]
+        print(f"  Selected handle: '{chosen['name']}'.")
+        self._transition_approach = chosen["approach"]
+        self._transition_grasp    = chosen["grasp"]
+        self._transition_carry    = chosen["carry"]
+        self._transition_release  = chosen["release"]
+
     def plan(
         self,
         max_attempts: int = 100,
@@ -906,6 +969,7 @@ class Orchestrator:
             self.sync_from_robot(timeout=sync_timeout)
 
         self.problem.constraintGraph(self.graph)
+        self._select_best_handle()
         planner = TransitionPlanner(self.problem)
         planner.maxIterations(1000)
 
@@ -1449,24 +1513,6 @@ class Orchestrator:
     def _se3_from_translation_quaternion(cls, t, q) -> pin.SE3:
         return pin.SE3(cls._rotation_from_xyzw(q), np.asarray(t, dtype=float))
 
-    @staticmethod
-    def _flatten_orientation_to_table(q: list) -> list:
-        """Keep only yaw (rotation about world Z) from a detected orientation,
-        discarding roll/pitch. The object always rests flat on the table in
-        this demo, so any roll/pitch in a HappyPose estimate is estimation
-        noise — T-LESS parts are symmetric/textureless and prone to ~180 deg
-        orientation flips that HappyPose can't distinguish from the true pose,
-        but which make the handle unreachable for grasping."""
-        rot = Orchestrator._rotation_from_xyzw(q)
-        yaw = np.arctan2(rot[1, 0], rot[0, 0])
-        flat_rot = np.array([
-            [np.cos(yaw), -np.sin(yaw), 0.0],
-            [np.sin(yaw),  np.cos(yaw), 0.0],
-            [0.0,          0.0,         1.0],
-        ])
-        flat_quat = pin.Quaternion(flat_rot)
-        return [flat_quat.x, flat_quat.y, flat_quat.z, flat_quat.w]
-
     @classmethod
     def _pose_to_se3(cls, pose) -> pin.SE3:
         """Convert common HappyPose/ROS/numpy pose containers to pin.SE3."""
@@ -1679,10 +1725,10 @@ class Orchestrator:
 
         base_T_object = base_T_camera * camera_T_object
         quat = pin.Quaternion(base_T_object.rotation)
-        q = self._flatten_orientation_to_table([quat.x, quat.y, quat.z, quat.w])
+        q = [quat.x, quat.y, quat.z, quat.w]
         t = self._resolve_table_collision(base_T_object.translation, q)
         self.update_object_pose(t, q)
-        base_T_object = pin.SE3(self._rotation_from_xyzw(q), np.array(t))
+        base_T_object = pin.SE3(base_T_object.rotation, np.array(t))
         return base_T_object
 
     # ── Pose comparison ───────────────────────────────────────────────────────

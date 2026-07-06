@@ -12,6 +12,11 @@
     <link name="base_link"/>
     <mask>1 1 1 1 1 1</mask>
   </handle>
+  <handle name="goal_handle_down" clearance="0.05" approaching_direction="0 0 1">
+    <position xyz="0.0 0.0 0.0" xyzw="0 0 0 1"/>
+    <link name="base_link"/>
+    <mask>1 1 1 1 1 1</mask>
+  </handle>
   <!-- <handle name="side_A_zp_yp" clearance="0.03">
     <position xyz="0.05 -0.019 0.0" xyzw="0.0 -0.7071067811865475 0.0 0.7071067811865476"/>
     <link name="base_link"/>
