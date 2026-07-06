@@ -26,6 +26,7 @@ import subprocess
 import sys
 import glob
 import copy
+from contextlib import contextmanager
 import tempfile
 import time
 import numpy as np
@@ -53,6 +54,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from agimus_msgs.msg import MpcInput, MpcEEInput
 from sensor_msgs.msg import JointState
 from std_srvs.srv import Empty
+from vision_msgs.msg import Detection2DArray
 
 
 # ── File paths ────────────────────────────────────────────────────────────────
@@ -75,6 +77,12 @@ TIME_SCALE = _cfg["trajectory"]["time_scale"]
 
 _obj_cfg    = _cfg["object"]
 OBJ_NAME    = _obj_cfg["name"]
+OBJECT_DATASET = _obj_cfg.get("dataset", "tless")
+
+
+def _happypose_class_id(obj_name: str, dataset: str) -> str:
+    num_part = obj_name.rsplit("_", 1)[-1]
+    return f"{dataset}-obj_{int(num_part):06d}"
 
 
 def _qualify_object_resource_name(name: str) -> str:
@@ -102,9 +110,7 @@ def _resolve_object_asset_path(base_dir: str, extension: str) -> str:
 
 OBJ_SRDF    = _resolve_object_asset_path(_HPP_DIR, ".srdf")
 OBJ_URDF    = _resolve_object_asset_path(os.path.join(_PKG_DIR, "urdf"), ".urdf")
-OBJ_LINK    = _qualify_object_resource_name(_obj_cfg.get("link", "base_link"))
 HANDLE_NAME = _qualify_object_resource_name(_obj_cfg.get("handle_name", "goal_handle_up"))
-HANDLE_CLEAR = _obj_cfg.get("handle_clearance", 0.05)
 OBJ_INIT_POS = np.array([_obj_cfg["x"], _obj_cfg["y"], _obj_cfg["z"]])
 
 LEFT_ARM_TUCK  = _cfg["tuck"]["left_arm"]
@@ -124,6 +130,8 @@ GRIPPER_OPEN_POSITION = 0.07
 GRIPPER_CLOSED_POSITION = 0.0
 GRIPPER_MOTION_DURATION = 1.5
 HPP_FIXED_JOINT_EPS = 1e-6
+TABLE_COLLISION_MAX_LIFT = 0.10   # max upward correction (m) before giving up
+TABLE_COLLISION_STEP     = 0.005  # z increment per collision-check iteration (m)
 LEFT_GRIPPER_HPP_JOINT_MULTIPLIERS = (
     ("gripper_left_finger_joint", 1.0),
     ("gripper_left_left_finger_joint", 1.0),
@@ -176,35 +184,6 @@ JOINT_STATE_QOS_PROFILES = (
         reliability=ReliabilityPolicy.BEST_EFFORT,
     ),
 )
-
-
-# ── ROS2 trajectory publisher ─────────────────────────────────────────────────
-
-class _TrajectoryPublisherNode(Node):
-    """One-shot ROS2 node that publishes pre-computed MpcInput messages."""
-
-    def __init__(self, messages: list):
-        super().__init__("hpp_trajectory_publisher")
-        self._messages = messages
-        self._idx = 0
-        qos = QoSProfile(depth=1000, reliability=ReliabilityPolicy.BEST_EFFORT)
-        self._pub = self.create_publisher(MpcInput, "mpc_input", qos)
-        self._timer = self.create_timer(DT, self._publish_next)
-        self.get_logger().info(
-            f"Publishing {len(self._messages)} trajectory points at {1/DT:.0f} Hz …"
-        )
-        self._done = False
-
-    def _publish_next(self):
-        if self._idx >= len(self._messages):
-            if not self._done:
-                self.get_logger().info("Trajectory fully published.")
-                self._done = True
-            self._timer.cancel()
-            return
-        self._pub.publish(self._messages[self._idx])
-        self._idx += 1
-
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
@@ -670,7 +649,21 @@ class Orchestrator:
         graph.initialize()
 
         self.problem = problem
+        self.problem.addConfigValidation("CollisionValidation")
         self.graph   = graph
+
+    @staticmethod
+    def _find_transition_between(graph, source_state, target_state, found_label: str):
+        for name in graph.getTransitionNames():
+            try:
+                edge = graph.getTransition(name)
+                edge_source, edge_target = graph.getNodesConnectedByTransition(edge)
+            except Exception:
+                continue
+            if edge_source == source_state and edge_target == target_state:
+                print(f"  {found_label} edge found: '{name}'")
+                return edge
+        return None
 
     @staticmethod
     def _find_carry_edge(graph, grasp_transition):
@@ -681,15 +674,11 @@ class Orchestrator:
             grasped_state = None
 
         if grasped_state is not None:
-            for name in graph.getTransitionNames():
-                try:
-                    edge = graph.getTransition(name)
-                    source_state, target_state = graph.getNodesConnectedByTransition(edge)
-                except Exception:
-                    continue
-                if source_state == grasped_state and target_state == grasped_state:
-                    print(f"  Carry edge found: '{name}'")
-                    return edge
+            edge = Orchestrator._find_transition_between(
+                graph, grasped_state, grasped_state, "Carry"
+            )
+            if edge is not None:
+                return edge
 
         print("  WARNING: carry edge not found — p3 will be skipped.")
         return None
@@ -705,20 +694,187 @@ class Orchestrator:
             print("  WARNING: release edge not found — p4 will use reversed p2.")
             return None
 
-        for name in graph.getTransitionNames():
-            try:
-                edge = graph.getTransition(name)
-                source_state, target_state = graph.getNodesConnectedByTransition(edge)
-            except Exception:
-                continue
-            if source_state == grasped_state and target_state == pre_grasp_state:
-                print(f"  Release edge found: '{name}'")
-                return edge
+        edge = Orchestrator._find_transition_between(
+            graph, grasped_state, pre_grasp_state, "Release"
+        )
+        if edge is not None:
+            return edge
 
         print("  WARNING: release edge not found — p4 will use reversed p2.")
         return None
 
     # ── Planning ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _path_seconds(path) -> float:
+        tr = path.timeRange()
+        return tr.second - tr.first
+
+    @staticmethod
+    def _is_iteration_limit_error(exc: Exception) -> bool:
+        return "Maximal number of iterations reached" in str(exc)
+
+    def _optimize_path(
+        self,
+        path,
+        label: str,
+        shortcut,
+        spline_opt,
+        shortcut_passes: int = 3,
+        use_spline: bool = True,
+    ):
+        optimize_start = time.perf_counter()
+        try:
+            for i in range(max(0, shortcut_passes)):
+                p_new = shortcut.optimize(path)
+                dt = self._path_seconds(path) - self._path_seconds(p_new)
+                path = p_new
+                print(
+                    f"  {label} shortcut {i+1}/{shortcut_passes}: "
+                    f"{self._path_seconds(path):.2f} s  (−{dt:.2f} s)"
+                )
+                if dt < 1e-3:
+                    break
+        except Exception as e:
+            print(f"  {label} shortcut failed: {e}")
+        if use_spline:
+            try:
+                path = spline_opt.optimize(path)
+                print(f"  {label} spline: {self._path_seconds(path):.2f} s")
+            except Exception as e:
+                print(f"  {label} spline failed: {e}")
+        print(
+            f"  {label} optimization time: "
+            f"{time.perf_counter() - optimize_start:.2f} s"
+        )
+        return path
+
+    def _plan_transition_path(
+        self,
+        planner,
+        q_goal,
+        transition,
+        q_start,
+        q_target,
+        label: str,
+    ):
+        planner.setTransition(transition)
+        q_goal[0, :] = q_target
+        print(f"Planning {label} …")
+        plan_start = time.perf_counter()
+        path = planner.planPath(q_start, q_goal, True)
+        short_label = label.split()[0]
+        print(
+            f"  {short_label} found in {time.perf_counter() - plan_start:.2f} s "
+            f"({self._path_seconds(path):.2f} s path)."
+        )
+        return path
+
+    def _find_approach_path(self, planner, q_goal, max_attempts: int):
+        shooter = self.problem.configurationShooter()
+        approach_validator = self._transition_approach.pathValidation()
+        grasp_validator = self._transition_grasp.pathValidation()
+        valid_candidate_count = 0
+        search_start = time.perf_counter()
+
+        for attempt in range(max_attempts):
+            q = shooter.shoot()
+            res, qpg, err = self.graph.generateTargetConfig(
+                self._transition_approach, self.q_init, q
+            )
+            if not res or not approach_validator.validateConfiguration(qpg)[0]:
+                continue
+
+            res, qg, qg_err = self.graph.generateTargetConfig(
+                self._transition_grasp, qpg, qpg
+            )
+            if not res or not grasp_validator.validateConfiguration(qg)[0]:
+                continue
+
+            valid_candidate_count += 1
+            print(
+                f"  qpg candidate found at attempt {attempt + 1}, err={err:.2e}, "
+                f"search={time.perf_counter() - search_start:.2f} s"
+            )
+
+            try:
+                p1 = self._plan_transition_path(
+                    planner, q_goal, self._transition_approach,
+                    self.q_init, qpg, "p1 (approach)"
+                )
+            except RuntimeError as exc:
+                if not self._is_iteration_limit_error(exc):
+                    raise
+                print(
+                    f"  p1 hit the planner iteration limit for qpg candidate {attempt + 1} "
+                    "after trying to connect from q_init; sampling another candidate."
+                )
+                continue
+
+            return p1, qpg, qg, qg_err
+
+        elapsed = time.perf_counter() - search_start
+        if valid_candidate_count == 0:
+            print(
+                "Failed to find collision-free qpg/qg pair in "
+                f"{max_attempts} attempts ({elapsed:.2f} s)."
+            )
+        else:
+            print(
+                f"Found {valid_candidate_count} collision-free qpg/qg candidate(s), "
+                "but none could be connected from q_init within the planner iteration budget "
+                f"after {elapsed:.2f} s."
+            )
+        return None, None, None, None
+
+    def _plan_carry_and_release(
+        self,
+        planner,
+        q_goal,
+        qg,
+        fallback_p4,
+        shortcut,
+        spline_opt,
+    ):
+        p3 = None
+        p4 = fallback_p4
+        if self._transition_carry is None:
+            return p3, p4
+
+        q_drop = self._find_drop_config(qg)
+        if q_drop is None:
+            return p3, p4
+
+        try:
+            p3 = self._plan_transition_path(
+                planner, q_goal, self._transition_carry,
+                qg, q_drop, "p3 (carry to drop zone)"
+            )
+            p3 = self._optimize_path(p3, "p3", shortcut, spline_opt)
+            self.q_drop = q_drop
+        except Exception as e:
+            print(f"  p3 planning failed: {e}.  Skipping carry phase.")
+            return None, p4
+
+        q_predrop = self._find_predrop_config(q_drop)
+        if q_predrop is None:
+            print("  No pre-drop config — skipping retreat at drop zone.")
+            self.q_predrop = None
+            return p3, None
+
+        try:
+            p4 = self._plan_transition_path(
+                planner, q_goal, self._transition_release,
+                q_drop, q_predrop, "p4 (release at drop zone)"
+            )
+            p4 = self._optimize_path(p4, "p4", shortcut, spline_opt)
+            self.q_predrop = q_predrop
+        except Exception as ep4:
+            print(f"  p4 planning failed: {ep4}.  Skipping retreat at drop zone.")
+            p4 = None
+            self.q_predrop = None
+
+        return p3, p4
 
     def plan(
         self,
@@ -749,7 +905,6 @@ class Orchestrator:
         if sync_with_robot:
             self.sync_from_robot(timeout=sync_timeout)
 
-        # ── 0. Planner setup ────────────────────────────────────────────────
         self.problem.constraintGraph(self.graph)
         planner = TransitionPlanner(self.problem)
         planner.maxIterations(1000)
@@ -758,184 +913,33 @@ class Orchestrator:
         spline_opt = SplineGradientBased_bezier3(self.problem)
         q_goal = np.zeros((1, self.robot.configSize()), order='F')
 
-        def _path_seconds(path) -> float:
-            tr = path.timeRange()
-            return tr.second - tr.first
-
-        def _is_iteration_limit_error(exc: Exception) -> bool:
-            return "Maximal number of iterations reached" in str(exc)
-
-        def _optimize(path, label, shortcut_passes: int = 3, use_spline: bool = True):
-            optimize_start = time.perf_counter()
-            try:
-                for i in range(max(0, shortcut_passes)):
-                    p_new = shortcut.optimize(path)
-                    dt = _path_seconds(path) - _path_seconds(p_new)
-                    path = p_new
-                    print(
-                        f"  {label} shortcut {i+1}/{shortcut_passes}: "
-                        f"{_path_seconds(path):.2f} s  (−{dt:.2f} s)"
-                    )
-                    if dt < 1e-3:
-                        break
-            except Exception as e:
-                print(f"  {label} shortcut failed: {e}")
-            if use_spline:
-                try:
-                    path = spline_opt.optimize(path)
-                    print(f"  {label} spline: {_path_seconds(path):.2f} s")
-                except Exception as e:
-                    print(f"  {label} spline failed: {e}")
-            print(f"  {label} optimization time: {time.perf_counter() - optimize_start:.2f} s")
-            return path
-
-        # ── 1. Find collision-free, reachable pre-grasp config (qpg) ────────
-        shooter = self.problem.configurationShooter()
-        approach_validator = self._transition_approach.pathValidation()
-        grasp_validator = self._transition_grasp.pathValidation()
-        p1 = None
-        qpg = None
-        qg = None
-        qg_err = None
-        valid_candidate_count = 0
-        search_start = time.perf_counter()
-        for i in range(max_attempts):
-            q = shooter.shoot()
-            res, q_cand, err = self.graph.generateTargetConfig(
-                self._transition_approach, self.q_init, q
-            )
-            if not res:
-                continue
-            res, _ = approach_validator.validateConfiguration(q_cand)
-            if not res:
-                continue
-
-            res, qg_cand, qg_err_cand = self.graph.generateTargetConfig(
-                self._transition_grasp, q_cand, q_cand
-            )
-            if not res:
-                continue
-            res, _ = grasp_validator.validateConfiguration(qg_cand)
-            if not res:
-                continue
-
-            valid_candidate_count += 1
-            print(
-                f"  qpg candidate found at attempt {i+1}, err={err:.2e}, "
-                f"search={time.perf_counter() - search_start:.2f} s"
-            )
-
-            planner.setTransition(self._transition_approach)
-            q_goal[0, :] = q_cand
-            print("Planning p1 (approach) …")
-            plan_start = time.perf_counter()
-            try:
-                p1_cand = planner.planPath(self.q_init, q_goal, True)
-            except RuntimeError as exc:
-                if not _is_iteration_limit_error(exc):
-                    raise
-                print(
-                    f"  p1 hit the planner iteration limit for qpg candidate {i+1} "
-                    f"after {time.perf_counter() - plan_start:.2f} s; "
-                    "sampling another candidate."
-                )
-                continue
-
-            qpg = q_cand
-            qg = qg_cand
-            qg_err = qg_err_cand
-            p1 = p1_cand
-            print(
-                f"  p1 found in {time.perf_counter() - plan_start:.2f} s "
-                f"({_path_seconds(p1):.2f} s path)."
-            )
-            break
-
+        p1, qpg, qg, qg_err = self._find_approach_path(
+            planner, q_goal, max_attempts
+        )
         if p1 is None:
-            elapsed = time.perf_counter() - search_start
-            if valid_candidate_count == 0:
-                print(
-                    "Failed to find collision-free qpg/qg pair in "
-                    f"{max_attempts} attempts ({elapsed:.2f} s)."
-                )
-            else:
-                print(
-                    f"Found {valid_candidate_count} collision-free qpg/qg candidate(s), "
-                    "but none could be connected from q_init within the planner iteration budget "
-                    f"after {elapsed:.2f} s."
-                )
             return False
 
-        # ── 2. Find grasped config (qg) ──────────────────────────────────────
         print(f"  qg: res=True, err={qg_err:.2e}")
-
-        # ── 3. Plan paths ────────────────────────────────────────────────────
-        p1 = _optimize(
+        p1 = self._optimize_path(
             p1,
             "p1",
+            shortcut,
+            spline_opt,
             shortcut_passes=approach_shortcut_passes,
             use_spline=approach_use_spline,
         )
 
-        # p2 — grasp
-        planner.setTransition(self._transition_grasp)
-        q_goal[0, :] = qg
-        print("Planning p2 (grasp) …")
-        plan_start = time.perf_counter()
-        p2 = planner.planPath(qpg, q_goal, True)
-        print(
-            f"  p2 found in {time.perf_counter() - plan_start:.2f} s "
-            f"({_path_seconds(p2):.2f} s path)."
+        p2 = self._plan_transition_path(
+            planner, q_goal, self._transition_grasp, qpg, qg, "p2 (grasp)"
         )
-        p2 = _optimize(p2, "p2")
+        p2 = self._optimize_path(p2, "p2", shortcut, spline_opt)
 
-        # p4 = reverse of p2 (release at pick location)
         p4 = p2.reverse()
         print("  p4 ready (release, reversed p2).")
 
-        # p3 — carry (optional, requires carry edge)
-        p3 = None
-        if self._transition_carry is not None:
-            q_drop = self._find_drop_config(qg)
-            if q_drop is not None:
-                planner.setTransition(self._transition_carry)
-                q_goal[0, :] = q_drop
-                print("Planning p3 (carry to drop zone) …")
-                try:
-                    plan_start = time.perf_counter()
-                    p3 = planner.planPath(qg, q_goal, True)
-                    print(
-                        f"  p3 found in {time.perf_counter() - plan_start:.2f} s "
-                        f"({_path_seconds(p3):.2f} s path)."
-                    )
-                    p3 = _optimize(p3, "p3")
-                    self.q_drop = q_drop
-                    # Plan p4: release at the drop zone.
-                    q_predrop = self._find_predrop_config(q_drop)
-                    if q_predrop is not None:
-                        planner.setTransition(self._transition_release)
-                        q_goal[0, :] = q_predrop
-                        print("Planning p4 (release at drop zone) …")
-                        try:
-                            plan_start = time.perf_counter()
-                            p4 = planner.planPath(q_drop, q_goal, True)
-                            print(
-                                f"  p4 found in {time.perf_counter() - plan_start:.2f} s "
-                                f"({_path_seconds(p4):.2f} s path)."
-                            )
-                            p4 = _optimize(p4, "p4")
-                            self.q_predrop = q_predrop
-                        except Exception as ep4:
-                            print(f"  p4 planning failed: {ep4}.  Skipping retreat at drop zone.")
-                            p4 = None
-                            self.q_predrop = None
-                    else:
-                        print("  No pre-drop config — skipping retreat at drop zone.")
-                        p4 = None
-                        self.q_predrop = None
-                except Exception as e:
-                    print(f"  p3 planning failed: {e}.  Skipping carry phase.")
-                    p3 = None
+        p3, p4 = self._plan_carry_and_release(
+            planner, q_goal, qg, p4, shortcut, spline_opt
+        )
 
         self.p1  = p1
         self.p2  = p2
@@ -1019,31 +1023,17 @@ class Orchestrator:
 
     # ── Path sampling ─────────────────────────────────────────────────────────
 
-    def _extract_active_q(self, q_full):
-        q = np.array(q_full)
-        ai = self._active_arm_idx
-        return q[ai:ai+7].copy()
-
-    def _active_velocity(self, q1, q2, dt):
-        return (q2 - q1) / dt
-
     def _sample_path(self, path):
         tr = path.timeRange()
         t_min, t_max = tr.first, tr.second
-        n     = max(2, int((t_max - t_min) * TIME_SCALE / DT))
+        n = max(2, int((t_max - t_min) * TIME_SCALE / DT))
         times = np.linspace(t_min, t_max, n)
-        q_list = [self._extract_active_q(path.eval(t)[0]) for t in times]
-        q_arr  = np.array(q_list)
-
-        dq_list = [self._active_velocity(q_arr[i], q_arr[i+1], DT)
-                   for i in range(len(q_arr) - 1)]
-        dq_list.append(dq_list[-1])
-        dq_arr = np.array(dq_list)
-
-        ddq_list = [(dq_arr[i+1] - dq_arr[i]) / DT
-                    for i in range(len(dq_arr) - 1)]
-        ddq_list.append(ddq_list[-1])
-        ddq_arr = np.array(ddq_list)
+        ai = self._active_arm_idx
+        q_arr = np.array([np.asarray(path.eval(t)[0])[ai:ai+7] for t in times])
+        dq_arr = np.diff(q_arr, axis=0) / DT
+        dq_arr = np.vstack([dq_arr, dq_arr[-1]])
+        ddq_arr = np.diff(dq_arr, axis=0) / DT
+        ddq_arr = np.vstack([ddq_arr, ddq_arr[-1]])
 
         return q_arr, dq_arr, ddq_arr
 
@@ -1099,15 +1089,22 @@ class Orchestrator:
             setattr(node, "_hpp_mpc_input_pub", pub)
         return pub
 
+    @contextmanager
     def _borrow_ros_node(self, name: str):
         if self._ros_node is not None:
-            return self._ros_node, False
-        return rclpy.create_node(name), True
+            yield self._ros_node
+            return
 
-    @staticmethod
-    def _release_ros_node(node: Node, own_node: bool) -> None:
-        if own_node:
+        node = rclpy.create_node(name)
+        try:
+            yield node
+        finally:
             node.destroy_node()
+
+    def _execution_node(self) -> Node:
+        if self._ros_node is None:
+            self._ros_node = rclpy.create_node("hpp_trajectory_publisher")
+        return self._ros_node
 
     @staticmethod
     def _wait_for_topic_message(node: Node, msg_type, topic: str, timeout: float, qos=10):
@@ -1129,6 +1126,15 @@ class Orchestrator:
             for sub in subs:
                 node.destroy_subscription(sub)
         return None
+
+    def _joint_state_map(self, node_name: str, timeout: float):
+        with self._borrow_ros_node(node_name) as node:
+            joint_state = self._wait_for_topic_message(
+                node, JointState, "/joint_states", timeout, qos=JOINT_STATE_QOS_PROFILES
+            )
+        if joint_state is None:
+            return None
+        return dict(zip(joint_state.name, joint_state.position))
 
     def _publish_hold_reference(self, node: Node) -> bool:
         if self._last_hold_msg is None:
@@ -1164,6 +1170,8 @@ class Orchestrator:
             for q, dq, ddq in zip(q_arr, dq_arr, ddq_arr):
                 msgs.append(self._build_msg(q, dq, ddq, idx))
                 idx += 1
+        if not msgs:
+            return []
         q_final  = msgs[-1].q
         dq_zero  = np.zeros(len(msgs[-1].qdot)).tolist()
         ddq_zero = np.zeros(len(msgs[-1].qddot)).tolist()
@@ -1207,18 +1215,10 @@ class Orchestrator:
         if not named_paths:
             return
 
-        node, own_node = self._borrow_ros_node("hpp_execute_alignment_check")
-        try:
-            joint_state = self._wait_for_topic_message(
-                node, JointState, "/joint_states", timeout, qos=JOINT_STATE_QOS_PROFILES
-            )
-        finally:
-            self._release_ros_node(node, own_node)
-
-        if joint_state is None:
+        js_map = self._joint_state_map("hpp_execute_alignment_check", timeout)
+        if js_map is None:
             return
 
-        js_map = dict(zip(joint_state.name, joint_state.position))
         q_actual = self._configuration_from_joint_state(js_map, q_seed=self.q_init)
 
         path, label = named_paths[0]
@@ -1252,34 +1252,40 @@ class Orchestrator:
 
     def _execute_paths(self, named_paths: list, n_hold: int = 200) -> None:
         """Build and publish MpcInput messages for the given (path, label) pairs."""
+        named_paths = [(path, label) for path, label in named_paths if path is not None]
+        if not named_paths:
+            print("No paths to execute.")
+            return
+
         self._warn_if_robot_far_from_path_start(named_paths)
         print("Sampling trajectories …")
         messages = self._build_messages(named_paths, n_hold=n_hold)
         self._messages = messages
         self._last_hold_msg = copy.deepcopy(messages[-1])
-        if named_paths:
-            last_path, last_label = named_paths[-1]
-            self._last_executed_q = np.array(
-                last_path.eval(last_path.timeRange().second)[0], copy=True
-            )
-            self._last_executed_label = last_label
+        last_path, last_label = named_paths[-1]
+        self._last_executed_q = np.array(
+            last_path.eval(last_path.timeRange().second)[0], copy=True
+        )
+        self._last_executed_label = last_label
 
-        if self._ros_node is None:
-            self._ros_node = _TrajectoryPublisherNode(messages)
-        else:
-            self._ros_node._messages = messages
-            self._ros_node._idx      = 0
-            self._ros_node._done     = False
-            self._ros_node._timer    = self._ros_node.create_timer(
-                DT, self._ros_node._publish_next
-            )
+        node = self._execution_node()
+        pub = self._ensure_mpc_publisher(node)
+        node.get_logger().info(
+            f"Publishing {len(messages)} trajectory points at {1/DT:.0f} Hz …"
+        )
 
         try:
-            while not self._ros_node._done:
-                rclpy.spin_once(self._ros_node, timeout_sec=0.0)
+            for msg in messages:
+                pub.publish(msg)
+                rclpy.spin_once(node, timeout_sec=0.0)
                 time.sleep(DT)
+            node.get_logger().info("Trajectory fully published.")
         except KeyboardInterrupt:
             print("\nExecution interrupted.")
+
+    def _execute_phase(self, title: str, path, label: str, n_hold: int) -> None:
+        print(f"\n=== {title} ===")
+        self._execute_paths([(path, label)], n_hold=n_hold)
 
     def _execute_full_sequence(self) -> None:
         """Execute the complete pick-and-drop sequence with automatic gripper control."""
@@ -1287,25 +1293,20 @@ class Orchestrator:
         print("\n=== Opening gripper ===")
         self.open_gripper()
 
-        print("\n=== Phase 1: Approach ===")
-        self._execute_paths([(self.p1, "p1 (approach)")], n_hold=50)
-
-        print("\n=== Phase 2: Grasp close-in ===")
-        self._execute_paths([(self.p2, "p2 (grasp)")], n_hold=50)
+        self._execute_phase("Phase 1: Approach", self.p1, "p1 (approach)", 50)
+        self._execute_phase("Phase 2: Grasp close-in", self.p2, "p2 (grasp)", 50)
 
         print("\n=== Closing gripper ===")
         self.close_gripper()
 
         if self.p3 is not None:
-            print("\n=== Phase 3: Carry to drop zone ===")
-            self._execute_paths([(self.p3, "p3 (carry)")], n_hold=50)
+            self._execute_phase("Phase 3: Carry to drop zone", self.p3, "p3 (carry)", 50)
 
         print("\n=== Opening gripper ===")
         self.open_gripper()
 
         if self.p4 is not None:
-            print("\n=== Phase 4: Release / retreat ===")
-            self._execute_paths([(self.p4, "p4 (release)")], n_hold=200)
+            self._execute_phase("Phase 4: Release / retreat", self.p4, "p4 (release)", 200)
         else:
             print("\n=== Phase 4: Release / retreat skipped ===")
 
@@ -1346,17 +1347,11 @@ class Orchestrator:
 
     def sync_from_robot(self, timeout: float = 5.0) -> bool:
         """Update q_init and locked planning joints from the current robot state."""
-        node, own_node = self._borrow_ros_node("hpp_sync_node")
-        joint_state = self._wait_for_topic_message(
-            node, JointState, "/joint_states", timeout, qos=JOINT_STATE_QOS_PROFILES
-        )
-        self._release_ros_node(node, own_node)
-
-        if joint_state is None:
+        js_map = self._joint_state_map("hpp_sync_node", timeout)
+        if js_map is None:
             print("sync_from_robot: timeout — could not receive /joint_states")
             return False
 
-        js_map = dict(zip(joint_state.name, joint_state.position))
         self._sync_fixed_joint_values(js_map)
 
         right_arm = self._arm_joint_state(js_map, "right")
@@ -1384,10 +1379,7 @@ class Orchestrator:
         action_label: str,
         timeout: float = 5.0,
     ) -> bool:
-        node, own_node = self._borrow_ros_node(
-            f"hpp_gripper_client_{time.monotonic_ns()}"
-        )
-        try:
+        with self._borrow_ros_node(f"hpp_gripper_client_{time.monotonic_ns()}") as node:
             client = node.create_client(Empty, service_name)
 
             deadline = time.time() + timeout
@@ -1413,8 +1405,6 @@ class Orchestrator:
 
             print(f"Left gripper {action_label} via '{service_name}'.")
             return True
-        finally:
-            self._release_ros_node(node, own_node)
 
     def open_gripper(
         self,
@@ -1442,6 +1432,122 @@ class Orchestrator:
 
     # ── Object pose update ────────────────────────────────────────────────────
 
+    @staticmethod
+    def _rotation_from_xyzw(q) -> np.ndarray:
+        x, y, z, w = np.asarray(q, dtype=float)
+        norm = np.linalg.norm([x, y, z, w])
+        if norm == 0.0:
+            raise ValueError("Quaternion norm is zero.")
+        x, y, z, w = x / norm, y / norm, z / norm, w / norm
+        return np.array([
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ])
+
+    @classmethod
+    def _se3_from_translation_quaternion(cls, t, q) -> pin.SE3:
+        return pin.SE3(cls._rotation_from_xyzw(q), np.asarray(t, dtype=float))
+
+    @staticmethod
+    def _flatten_orientation_to_table(q: list) -> list:
+        """Keep only yaw (rotation about world Z) from a detected orientation,
+        discarding roll/pitch. The object always rests flat on the table in
+        this demo, so any roll/pitch in a HappyPose estimate is estimation
+        noise — T-LESS parts are symmetric/textureless and prone to ~180 deg
+        orientation flips that HappyPose can't distinguish from the true pose,
+        but which make the handle unreachable for grasping."""
+        rot = Orchestrator._rotation_from_xyzw(q)
+        yaw = np.arctan2(rot[1, 0], rot[0, 0])
+        flat_rot = np.array([
+            [np.cos(yaw), -np.sin(yaw), 0.0],
+            [np.sin(yaw),  np.cos(yaw), 0.0],
+            [0.0,          0.0,         1.0],
+        ])
+        flat_quat = pin.Quaternion(flat_rot)
+        return [flat_quat.x, flat_quat.y, flat_quat.z, flat_quat.w]
+
+    @classmethod
+    def _pose_to_se3(cls, pose) -> pin.SE3:
+        """Convert common HappyPose/ROS/numpy pose containers to pin.SE3."""
+        if isinstance(pose, pin.SE3):
+            return pose.copy()
+
+        if isinstance(pose, dict):
+            for key in ("TCO", "T_CO", "camera_T_object", "matrix", "T"):
+                if key in pose:
+                    return cls._pose_to_se3(pose[key])
+            t = pose.get("translation", pose.get("t"))
+            q = pose.get("quaternion", pose.get("q"))
+            if t is not None and q is not None:
+                return cls._se3_from_translation_quaternion(t, q)
+
+        if hasattr(pose, "pose"):
+            return cls._pose_to_se3(pose.pose)
+        if hasattr(pose, "transform"):
+            return cls._pose_to_se3(pose.transform)
+        if hasattr(pose, "position") and hasattr(pose, "orientation"):
+            t = [pose.position.x, pose.position.y, pose.position.z]
+            q = [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
+            return cls._se3_from_translation_quaternion(t, q)
+        if hasattr(pose, "translation") and hasattr(pose, "rotation"):
+            t = [pose.translation.x, pose.translation.y, pose.translation.z]
+            q = [pose.rotation.x, pose.rotation.y, pose.rotation.z, pose.rotation.w]
+            return cls._se3_from_translation_quaternion(t, q)
+
+        arr = np.asarray(pose, dtype=float)
+        if arr.shape == (4, 4):
+            return pin.SE3(arr[:3, :3], arr[:3, 3])
+        if arr.shape == (7,):
+            return cls._se3_from_translation_quaternion(arr[:3], arr[3:])
+
+        raise ValueError(
+            "Expected a 4x4 transform, [x, y, z, qx, qy, qz, qw], "
+            "a dict with TCO/translation/quaternion, or a ROS Pose/Transform."
+        )
+
+    @staticmethod
+    def _pose_frame_id(pose):
+        if isinstance(pose, dict):
+            return pose.get("frame_id", pose.get("camera_frame", pose.get("frame")))
+        header = getattr(pose, "header", None)
+        if header is not None:
+            return header.frame_id
+        return None
+
+    def _lookup_transform_as_se3(
+        self,
+        target_frame: str,
+        source_frame: str,
+        timeout: float,
+    ) -> pin.SE3:
+        from rclpy.duration import Duration
+        from rclpy.time import Time
+        from tf2_ros import Buffer, TransformListener
+
+        last_error = None
+        with self._borrow_ros_node("hpp_happypose_tf_lookup") as node:
+            tf_buffer = Buffer()
+            TransformListener(tf_buffer, node)
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                rclpy.spin_once(node, timeout_sec=0.1)
+                try:
+                    transform = tf_buffer.lookup_transform(
+                        target_frame,
+                        source_frame,
+                        Time(),
+                        timeout=Duration(seconds=0.1),
+                    )
+                    return self._pose_to_se3(transform.transform)
+                except Exception as exc:
+                    last_error = exc
+
+        raise RuntimeError(
+            f"Could not transform HappyPose pose from '{source_frame}' to "
+            f"'{target_frame}' within {timeout}s: {last_error}"
+        )
+
     def update_object_pose(self, t: list, q: list = None) -> None:
         """Update object pose in q_init (and Viser if open).
 
@@ -1457,6 +1563,127 @@ class Orchestrator:
         if hasattr(self, "_viewer"):
             self._viewer(self.q_init)
         print(f"Object pose updated: t={np.round(t, 4).tolist()}, q={np.round(q, 4).tolist()}")
+
+    @staticmethod
+    def _collision_involves_object_and_table(report) -> bool:
+        names = str(report).lower()
+        return "table" in names and OBJ_NAME.lower() in names
+
+    def _resolve_table_collision(self, t: list, q: list) -> list:
+        """If (t, q) puts the object in collision with the table, lift it
+        along z (keeping x/y and orientation) until clear. Returns t
+        unchanged if there's no table collision, or if it can't be cleared
+        within TABLE_COLLISION_MAX_LIFT (a warning is printed in that case)."""
+        q_candidate = np.array(self.q_init, copy=True)
+        oi = self._obj_idx
+
+        def set_z(z):
+            q_candidate[oi:oi + 3] = [t[0], t[1], z]
+            q_candidate[oi + 3:oi + 7] = q
+
+        set_z(t[2])
+        ok, report = self.problem.isConfigValid(q_candidate)
+        if ok:
+            return t
+        if not self._collision_involves_object_and_table(report):
+            print("  WARNING: detected object pose is invalid but not due to a "
+                  "table collision; leaving pose as detected.")
+            return t
+
+        z = t[2]
+        n_steps = int(TABLE_COLLISION_MAX_LIFT / TABLE_COLLISION_STEP)
+        for _ in range(n_steps):
+            z += TABLE_COLLISION_STEP
+            set_z(z)
+            ok, report = self.problem.isConfigValid(q_candidate)
+            if ok:
+                print(f"  Object raised {z - t[2]:.3f} m to clear the table.")
+                return [t[0], t[1], z]
+            if not self._collision_involves_object_and_table(report):
+                break  # a different collision appeared; stop chasing it
+
+        print(f"  WARNING: could not clear table collision within "
+              f"{TABLE_COLLISION_MAX_LIFT} m; using original detected z.")
+        return t
+
+    def _latest_happypose_detection(self, timeout: float):
+        """Wait for /happypose/detections and return (pose, frame_id) for the
+        highest-confidence detection matching the configured object."""
+        with self._borrow_ros_node("hpp_happypose_detections") as node:
+            msg = self._wait_for_topic_message(
+                node, Detection2DArray, "/happypose/detections", timeout
+            )
+        if msg is None:
+            raise RuntimeError(
+                f"No /happypose/detections message received within {timeout}s."
+            )
+
+        target_class_id = _happypose_class_id(OBJ_NAME, OBJECT_DATASET)
+        matches = [
+            d for d in msg.detections
+            if d.results and d.results[0].hypothesis.class_id == target_class_id
+        ]
+        if not matches:
+            seen = sorted({d.results[0].hypothesis.class_id for d in msg.detections if d.results})
+            raise RuntimeError(
+                f"No detection for '{target_class_id}' in /happypose/detections "
+                f"(saw: {', '.join(seen) or 'none'})."
+            )
+        best = max(matches, key=lambda d: d.results[0].hypothesis.score)
+        return best.results[0].pose.pose, best.header.frame_id
+
+    def update_object_pose_from_happypose(
+        self,
+        happypose_pose=None,
+        camera_frame: str = None,
+        base_T_camera=None,
+        base_frame: str = "base_footprint",
+        timeout: float = 5.0,
+        detections_timeout: float = 5.0,
+    ) -> pin.SE3:
+        """Update the object pose from a HappyPose camera_T_object estimate.
+
+        If happypose_pose is not given, the latest /happypose/detections
+        message is read and the highest-confidence detection matching the
+        configured object (OBJ_NAME) is used instead. Otherwise happypose_pose
+        may be a 4x4 TCO matrix, [x, y, z, qx, qy, qz, qw], a dict containing
+        TCO/translation/quaternion, or a ROS Pose/Transform.
+        If base_T_camera is not passed, camera_frame is looked up in TF.
+
+        detections_timeout/timeout are generous (5s) because both waits race
+        ROS2 discovery of a freshly created node's subscriptions (the
+        /happypose/detections publisher and the TF broadcasters); on a busy
+        system discovery can take longer than the previous 1s default,
+        which is what caused intermittent "frame does not exist" failures.
+        Nothing is written to q_init until both reads succeed — a timeout or
+        an unmatched object raises RuntimeError instead of updating the pose.
+        Returns the resulting base_T_object transform.
+        """
+        if happypose_pose is None:
+            happypose_pose, detected_frame = self._latest_happypose_detection(detections_timeout)
+            camera_frame = camera_frame or detected_frame
+
+        camera_T_object = self._pose_to_se3(happypose_pose)
+
+        if base_T_camera is None:
+            camera_frame = camera_frame or self._pose_frame_id(happypose_pose)
+            if not camera_frame:
+                raise ValueError(
+                    "camera_frame is required when base_T_camera is not provided."
+                )
+            base_T_camera = self._lookup_transform_as_se3(
+                base_frame, camera_frame, timeout
+            )
+        else:
+            base_T_camera = self._pose_to_se3(base_T_camera)
+
+        base_T_object = base_T_camera * camera_T_object
+        quat = pin.Quaternion(base_T_object.rotation)
+        q = self._flatten_orientation_to_table([quat.x, quat.y, quat.z, quat.w])
+        t = self._resolve_table_collision(base_T_object.translation, q)
+        self.update_object_pose(t, q)
+        base_T_object = pin.SE3(self._rotation_from_xyzw(q), np.array(t))
+        return base_T_object
 
     # ── Pose comparison ───────────────────────────────────────────────────────
 
@@ -1482,18 +1709,11 @@ class Orchestrator:
 
         q_ref = self._as_full_configuration(q_ref)
 
-        node, own_node = self._borrow_ros_node("hpp_compare_pose")
-        try:
-            joint_state = self._wait_for_topic_message(
-                node, JointState, "/joint_states", timeout, qos=JOINT_STATE_QOS_PROFILES
-            )
-        finally:
-            self._release_ros_node(node, own_node)
-        if joint_state is None:
+        js_map = self._joint_state_map("hpp_compare_pose", timeout)
+        if js_map is None:
             print("compare_pose: timeout reading /joint_states")
             return
 
-        js_map = dict(zip(joint_state.name, joint_state.position))
         q_actual = self._configuration_from_joint_state(js_map, q_seed=self.q_init)
         ai = self._active_arm_idx
 

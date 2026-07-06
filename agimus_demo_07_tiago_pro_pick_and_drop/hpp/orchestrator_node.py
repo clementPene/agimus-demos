@@ -32,6 +32,7 @@ banner = (
     "║  o.open_gripper()            — open the left gripper in Gazebo ║\n"
     "║  o.close_gripper()           — close the left gripper in Gazebo║\n"
     "║  o.update_object_pose(t, q)  — update obj position in q_init   ║\n"
+    "║  o.update_object_pose_from_happypose() — move obj from vision  ║\n"
     "║  o.activate_lfc()            — switch to torque control        ║\n"
     "║  o.deactivate_lfc()          — switch back to position control ║\n"
     "║  o.plan()                    — run HPP planner (p1–p4)         ║\n"

@@ -9,7 +9,7 @@
         <mesh filename="package://agimus_demo_07_tiago_pro_pick_and_drop/urdf/obj_23.obj"/>
       </geometry>
       <material name="tless_magenta">
-        <color rgba="0.9 0.0 0.9 1.0"/>
+        <color rgba="1.0 1.0 1.0 1.0"/>
       </material>
     </visual>
     <collision>
