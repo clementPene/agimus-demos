@@ -3,17 +3,17 @@
    <link name="base_link">
       <visual>
          <geometry>
-            <mesh filename="package://agimus_demo_05_pick_and_place/urdf/tless/obj_25.obj"
-               scale="0.001 0.001 0.001" />
+            <mesh filename="package://agimus_demo_07_tiago_pro_pick_and_drop/urdf/obj_25.obj"
+               scale="1 1 1" />
          </geometry>
-         <material name="mat_part0">
-            <color rgba="0.0 0.9 0.0 1.0" />
+         <material name="tless_white">
+            <color rgba="1.0 1.0 1.0 1.0"/>
          </material>
       </visual>
       <collision>
          <geometry>
-            <mesh filename="package://agimus_demo_05_pick_and_place/urdf/tless/obj_25.obj"
-               scale="0.001 0.001 0.001" />
+            <mesh filename="package://agimus_demo_07_tiago_pro_pick_and_drop/urdf/obj_25.obj"
+               scale="1 1 1" />
          </geometry>
       </collision>
       <inertial>

@@ -8,7 +8,7 @@
       <geometry>
         <mesh filename="package://agimus_demo_07_tiago_pro_pick_and_drop/urdf/obj_23.obj"/>
       </geometry>
-      <material name="tless_magenta">
+      <material name="tless_white">
         <color rgba="1.0 1.0 1.0 1.0"/>
       </material>
     </visual>
