@@ -14,6 +14,10 @@ trajectory:
 # Shipped object assets: obj_01, obj_20, obj_21, obj_22, obj_23, obj_23,
 # obj_26, obj_31.
 object:
+  # Fallback object when no /happypose/detections message arrives at startup
+  # (e.g. camera/vision not running yet). When a detection is available, the
+  # orchestrator identifies the present object from its class_id instead —
+  # see Orchestrator._detect_present_object() in orchestrator.py.
   name: "obj_23"
   # The orchestrator resolves the URDF/SRDF from object.name.
   # Bare resource names are auto-qualified to <object.name>/... inside HPP.

@@ -22,6 +22,7 @@ Pass auto_gripper=False to stream all phases without gripper commands.
 """
 
 import os
+import re
 import subprocess
 import sys
 import glob
@@ -76,7 +77,7 @@ DT         = _cfg["trajectory"]["dt"]
 TIME_SCALE = _cfg["trajectory"]["time_scale"]
 
 _obj_cfg    = _cfg["object"]
-OBJ_NAME    = _obj_cfg["name"]
+_DEFAULT_OBJ_NAME = _obj_cfg["name"]
 OBJECT_DATASET = _obj_cfg.get("dataset", "tless")
 
 
@@ -85,25 +86,49 @@ def _happypose_class_id(obj_name: str, dataset: str) -> str:
     return f"{dataset}-obj_{int(num_part):06d}"
 
 
-def _resolve_object_asset_path(base_dir: str, extension: str) -> str:
-    object_basename = OBJ_NAME.rsplit("/", 1)[-1]
+_CLASS_ID_RE = re.compile(r"^(?P<dataset>.+)-obj_(?P<num>\d+)$")
+
+
+def _obj_name_from_class_id(class_id: str, dataset: str):
+    """Reverse of _happypose_class_id, e.g. 'tless-obj_000023' -> 'obj_23'.
+    Returns None if class_id doesn't match the expected dataset/format."""
+    m = _CLASS_ID_RE.match(class_id)
+    if not m or m.group("dataset") != dataset:
+        return None
+    return f"obj_{int(m.group('num')):02d}"
+
+
+_OBJ_ASSET_RE = re.compile(r"^(obj_\d+)\.(srdf|urdf)$")
+
+
+def _list_available_objects() -> list:
+    """Names of objects that ship BOTH a .srdf (in hpp/) and .urdf (in urdf/)
+    asset — this is what "objects present in the hpp folder" resolves to."""
+    def _names(base_dir, ext):
+        names = set()
+        for fname in os.listdir(base_dir):
+            m = _OBJ_ASSET_RE.match(fname)
+            if m and m.group(2) == ext:
+                names.add(m.group(1))
+        return names
+
+    srdf_names = _names(_HPP_DIR, "srdf")
+    urdf_names = _names(os.path.join(_PKG_DIR, "urdf"), "urdf")
+    return sorted(srdf_names & urdf_names)
+
+
+def _resolve_object_asset_path(base_dir: str, extension: str, obj_name: str) -> str:
+    object_basename = obj_name.rsplit("/", 1)[-1]
     path = os.path.join(base_dir, f"{object_basename}{extension}")
     if os.path.exists(path):
         return path
 
-    available = sorted({
-        os.path.splitext(item_name)[0]
-        for item_name in os.listdir(base_dir)
-        if item_name.startswith("obj_") and item_name.endswith(extension)
-    })
     raise FileNotFoundError(
-        f"Configured object '{OBJ_NAME}' expects asset '{path}', but it was not found. "
-        f"Available objects: {', '.join(available)}"
+        f"Configured object '{obj_name}' expects asset '{path}', but it was not found. "
+        f"Available objects: {', '.join(_list_available_objects())}"
     )
 
 
-OBJ_SRDF    = _resolve_object_asset_path(_HPP_DIR, ".srdf")
-OBJ_URDF    = _resolve_object_asset_path(os.path.join(_PKG_DIR, "urdf"), ".urdf")
 OBJ_INIT_POS = np.array([_obj_cfg["x"], _obj_cfg["y"], _obj_cfg["z"]])
 
 LEFT_ARM_TUCK  = _cfg["tuck"]["left_arm"]
@@ -202,6 +227,7 @@ class Orchestrator:
         self._last_executed_label = None
         self._next_msg_id = 0
         self._fixed_joint_values = dict(DEFAULT_FIXED_JOINT_VALUES)
+        self._obj_name = _DEFAULT_OBJ_NAME
 
         print("Loading HPP model …")
         self._setup_model()
@@ -492,9 +518,13 @@ class Orchestrator:
             TABLE_URDF, TABLE_SRDF,
             pin.SE3(np.eye(3), np.array([TABLE_OFFSET_X, 0, 0])),
         )
+        self._obj_srdf = _resolve_object_asset_path(_HPP_DIR, ".srdf", self._obj_name)
+        self._obj_urdf = _resolve_object_asset_path(
+            os.path.join(_PKG_DIR, "urdf"), ".urdf", self._obj_name
+        )
         urdf.loadModel(
-            robot, 0, OBJ_NAME, "freeflyer",
-            OBJ_URDF, OBJ_SRDF,
+            robot, 0, self._obj_name, "freeflyer",
+            self._obj_urdf, self._obj_srdf,
             pin.SE3(np.eye(3), np.array([0, 0, 0])),
         )
 
@@ -507,7 +537,7 @@ class Orchestrator:
         # object — no per-object handle list to maintain in config.
         self._handle_names = sorted(
             entry.key() for entry in robot.handles()
-            if entry.key().startswith(f"{OBJ_NAME}/")
+            if entry.key().startswith(f"{self._obj_name}/")
         )
 
         def _idx(name):
@@ -539,7 +569,7 @@ class Orchestrator:
             _idx(self._right_arm_joint_names[0])
             if self._right_arm_joint_names else None
         )
-        self._obj_idx       = _idx(f"{OBJ_NAME}/root_joint")
+        self._obj_idx       = _idx(f"{self._obj_name}/root_joint")
 
         # Use LEFT arm for picking (has pal-pro-gripper with actual gripper mechanism)
         self._active_arm_idx = self._left_arm_idx
@@ -570,7 +600,7 @@ class Orchestrator:
 
     def _set_obj_bounds(self, x, y, z, margin: float = 1.0):
         """Lock object position with tight bounds so HPP cannot move it freely."""
-        self.robot.setJointBounds(f"{OBJ_NAME}/root_joint", [
+        self.robot.setJointBounds(f"{self._obj_name}/root_joint", [
             x - margin, x + margin,
             y - margin, y + margin,
             z - margin, z + margin,
@@ -592,7 +622,7 @@ class Orchestrator:
         graph.maxIterations(40)
         graph.errorThreshold(1e-3)
         factory.setGrippers([self._gripper_name])
-        factory.setObjects([OBJ_NAME], [self._handle_names], [[]])
+        factory.setObjects([self._obj_name], [self._handle_names], [[]])
         factory.generate()
 
         gripper = self._gripper_name
@@ -649,8 +679,8 @@ class Orchestrator:
 
         graph.addNumericalConstraintsToGraph(locked)
 
-        sm = SecurityMargins(problem, factory, ["tiago_pro", OBJ_NAME], robot)
-        sm.setSecurityMarginBetween("tiago_pro", OBJ_NAME, 0.0)
+        sm = SecurityMargins(problem, factory, ["tiago_pro", self._obj_name], robot)
+        sm.setSecurityMarginBetween("tiago_pro", self._obj_name, 0.0)
         sm.apply()
 
         # Disable collision between robot and object in grasp/carry transitions
@@ -662,7 +692,7 @@ class Orchestrator:
                 if jname and "/" not in jname:
                     graph.setSecurityMarginForTransition(
                         cand["grasp"], jname,
-                        f"{OBJ_NAME}/root_joint", float("-inf"),
+                        f"{self._obj_name}/root_joint", float("-inf"),
                     )
 
         graph.initialize()
@@ -1610,10 +1640,9 @@ class Orchestrator:
             self._viewer(self.q_init)
         print(f"Object pose updated: t={np.round(t, 4).tolist()}, q={np.round(q, 4).tolist()}")
 
-    @staticmethod
-    def _collision_involves_object_and_table(report) -> bool:
+    def _collision_involves_object_and_table(self, report) -> bool:
         names = str(report).lower()
-        return "table" in names and OBJ_NAME.lower() in names
+        return "table" in names and self._obj_name.lower() in names
 
     def _resolve_table_collision(self, t: list, q: list) -> list:
         """If (t, q) puts the object in collision with the table, lift it
@@ -1652,31 +1681,34 @@ class Orchestrator:
               f"{TABLE_COLLISION_MAX_LIFT} m; using original detected z.")
         return t
 
-    def _latest_happypose_detection(self, timeout: float):
-        """Wait for /happypose/detections and return (pose, frame_id) for the
-        highest-confidence detection matching the configured object."""
-        with self._borrow_ros_node("hpp_happypose_detections") as node:
+    def _detect_present_object(self, timeout: float = 3.0):
+        """Read one /happypose/detections message (no class filter yet —
+        object identity isn't known before the model is built) and return
+        (obj_name, pose, frame_id) for the highest-confidence detection that
+        matches a shipped T-LESS asset, or None if no such detection arrives
+        within timeout (caller falls back to the configured default)."""
+        with self._borrow_ros_node("hpp_object_detect") as node:
             msg = self._wait_for_topic_message(
                 node, Detection2DArray, "/happypose/detections", timeout
             )
         if msg is None:
-            raise RuntimeError(
-                f"No /happypose/detections message received within {timeout}s."
-            )
+            return None
 
-        target_class_id = _happypose_class_id(OBJ_NAME, OBJECT_DATASET)
-        matches = [
-            d for d in msg.detections
-            if d.results and d.results[0].hypothesis.class_id == target_class_id
-        ]
-        if not matches:
-            seen = sorted({d.results[0].hypothesis.class_id for d in msg.detections if d.results})
-            raise RuntimeError(
-                f"No detection for '{target_class_id}' in /happypose/detections "
-                f"(saw: {', '.join(seen) or 'none'})."
+        available = set(_list_available_objects())
+        candidates = []
+        for d in msg.detections:
+            if not d.results:
+                continue
+            obj_name = _obj_name_from_class_id(
+                d.results[0].hypothesis.class_id, OBJECT_DATASET
             )
-        best = max(matches, key=lambda d: d.results[0].hypothesis.score)
-        return best.results[0].pose.pose, best.header.frame_id
+            if obj_name in available:
+                candidates.append((d.results[0].hypothesis.score, obj_name, d))
+        if not candidates:
+            return None
+
+        _, obj_name, best = max(candidates, key=lambda c: c[0])
+        return obj_name, best.results[0].pose.pose, best.header.frame_id
 
     def update_object_pose_from_happypose(
         self,
@@ -1690,10 +1722,15 @@ class Orchestrator:
         """Update the object pose from a HappyPose camera_T_object estimate.
 
         If happypose_pose is not given, the latest /happypose/detections
-        message is read and the highest-confidence detection matching the
-        configured object (OBJ_NAME) is used instead. Otherwise happypose_pose
-        may be a 4x4 TCO matrix, [x, y, z, qx, qy, qz, qw], a dict containing
-        TCO/translation/quaternion, or a ROS Pose/Transform.
+        message is read and the highest-confidence detection (across ALL
+        shipped T-LESS assets, not just the currently loaded one) is used
+        instead. If that detection names a different object than the one
+        currently loaded, the HPP model/graph is rebuilt for it — this is
+        the single place object identity is (re)detected; Orchestrator()
+        itself just loads the configured fallback object at construction.
+        Otherwise happypose_pose may be a 4x4 TCO matrix,
+        [x, y, z, qx, qy, qz, qw], a dict containing TCO/translation/quaternion,
+        or a ROS Pose/Transform.
         If base_T_camera is not passed, camera_frame is looked up in TF.
 
         detections_timeout/timeout are generous (5s) because both waits race
@@ -1702,12 +1739,36 @@ class Orchestrator:
         system discovery can take longer than the previous 1s default,
         which is what caused intermittent "frame does not exist" failures.
         Nothing is written to q_init until both reads succeed — a timeout or
-        an unmatched object raises RuntimeError instead of updating the pose.
+        an unrecognized object raises RuntimeError instead of updating the pose.
         Returns the resulting base_T_object transform.
         """
         if happypose_pose is None:
-            happypose_pose, detected_frame = self._latest_happypose_detection(detections_timeout)
+            detected = self._detect_present_object(detections_timeout)
+            if detected is None:
+                raise RuntimeError(
+                    f"No /happypose/detections message received within {detections_timeout}s."
+                )
+            detected_name, happypose_pose, detected_frame = detected
             camera_frame = camera_frame or detected_frame
+
+            if detected_name != self._obj_name:
+                print(
+                    f"  Object changed: '{self._obj_name}' -> '{detected_name}'. "
+                    "Reloading HPP model …"
+                )
+                self._obj_name = detected_name
+                self._setup_model()
+                self._setup_graph()
+                # Stale Path/config objects reference the old problem/graph —
+                # drop them so execute()/compare_pose() can't use them by accident.
+                self.p1 = self.p2 = self.p3 = self.p4 = None
+                self.qpg = self.qg = self.q_drop = None
+                if hasattr(self, "_viewer"):
+                    # init_viewer() rebuilds the Viewer against the new
+                    # self.robot/problem/graph and reloads its mesh geometry —
+                    # just re-pushing q_init to the old Viewer only moves the
+                    # previous object's already-loaded mesh, it never swaps it.
+                    self.init_viewer(open=False)
 
         camera_T_object = self._pose_to_se3(happypose_pose)
 
