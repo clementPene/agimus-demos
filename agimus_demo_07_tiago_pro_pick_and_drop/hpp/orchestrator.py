@@ -76,6 +76,7 @@ with open(_CFG_FILE) as _f:
 
 DT         = _cfg["trajectory"]["dt"]
 TIME_SCALE = _cfg["trajectory"]["time_scale"]
+CARRY_TIME_SCALE = _cfg["trajectory"].get("carry_time_scale", TIME_SCALE)
 
 _obj_cfg    = _cfg["object"]
 _DEFAULT_OBJ_NAME = _obj_cfg["name"]
@@ -182,10 +183,6 @@ W_FRAME_ROT   = np.array(_w["w_frame_rot"])
 GRIPPER_OPEN_POSITION = 0.07     # m, fingertip travel used as the HPP planning target
 GRIPPER_CLOSED_POSITION = 0.0
 GRIPPER_MOTION_DURATION = 1.5     # s, unused delay kept for API compatibility (see open/close_gripper)
-LEFT_GRIPPER_POSITION_JOINT = "gripper_left_finger_joint"  # primary actuated joint (multiplier 1.0), used to confirm physical motion has stopped
-GRIPPER_STABLE_POSITION_TOLERANCE = 0.002  # m, max drift between samples to consider the gripper stopped
-GRIPPER_STABLE_DURATION = 0.3              # s, how long position must stay within tolerance before calling it settled
-GRIPPER_CONFIRM_TIMEOUT = 3.0              # s, max extra wait for /joint_states to confirm settling
 HPP_FIXED_JOINT_EPS = 1e-6        # +/- bound width used to "freeze" a joint for HPP planning
 TABLE_COLLISION_MAX_LIFT = 0.10   # max upward correction (m) before giving up
 TABLE_COLLISION_STEP     = 0.005  # z increment per collision-check iteration (m)
@@ -235,8 +232,14 @@ PATH_START_JOINT_WARN_RAD = 0.35
 # sent — the torque-controlled arm can still be catching up to it. These
 # bound how long _wait_for_arm_settled waits for /joint_states to confirm
 # the arm actually reached a path's final configuration before the next
-# phase (e.g. a gripper action) begins.
-ARM_SETTLE_JOINT_TOLERANCE = 0.03  # rad, max per-joint error to consider the arm "arrived"
+# phase (e.g. a gripper action) begins. The check is on end-effector pose,
+# not per-joint error: the MPC/OCP weights below prioritize Cartesian
+# tracking over exact joint posture (w_frame_trans/w_frame_rot >> w_q), so
+# a redundant joint can settle into a different null-space posture than HPP
+# planned — per-joint error then stays large even once the end-effector
+# (what actually matters for approach/grasp) has arrived.
+ARM_SETTLE_EE_POS_TOLERANCE_MM = 15.0  # mm, max end-effector position error to consider the arm "arrived"
+ARM_SETTLE_EE_ROT_TOLERANCE_DEG = 5.0  # deg, max end-effector orientation error to consider the arm "arrived"
 ARM_SETTLE_TIMEOUT = 10.0           # s, max extra wait for /joint_states to confirm arrival
 # /joint_states may be published with different QoS settings depending on
 # the source node, so we subscribe with all three and take whichever message
@@ -284,6 +287,8 @@ class Orchestrator:
         self._next_msg_id = 0
         self._fixed_joint_values = dict(DEFAULT_FIXED_JOINT_VALUES)
         self._obj_name = _DEFAULT_OBJ_NAME
+        self._latest_joint_state_map = {}
+        self._joint_state_subs = []
 
         print("Loading HPP model …")
         self._setup_model()
@@ -1304,15 +1309,15 @@ class Orchestrator:
 
     # ── Path sampling ─────────────────────────────────────────────────────────
 
-    def _sample_path(self, path):
-        """Resample an HPP path at DT intervals (sped up by TIME_SCALE) into
+    def _sample_path(self, path, time_scale: float = TIME_SCALE):
+        """Resample an HPP path at DT intervals (sped up by `time_scale`) into
         arm-only position/velocity/acceleration arrays for the MPC
         controller. HPP paths only give positions, so velocity/acceleration
         are derived by finite differences; the last row of each is just
         repeated once to keep all three arrays the same length."""
         tr = path.timeRange()
         t_min, t_max = tr.first, tr.second
-        n = max(2, int((t_max - t_min) * TIME_SCALE / DT))
+        n = max(2, int((t_max - t_min) * time_scale / DT))
         times = np.linspace(t_min, t_max, n)
         arm_idx = self._active_arm_idx
         q_arr = np.array([np.asarray(path.eval(t)[0])[arm_idx:arm_idx+7] for t in times])
@@ -1379,6 +1384,20 @@ class Orchestrator:
             setattr(node, "_hpp_mpc_input_pub", pub)
         return pub
 
+    @staticmethod
+    def _ensure_grasper_client(node: Node, service_name: str):
+        """Cache one Empty client per service name on `node`, mirroring
+        _ensure_mpc_publisher — needed because _call_grasper_service now runs
+        against the persistent execution node instead of a fresh throwaway
+        node per call, so a naive create_client() would leak a new client
+        object on every gripper action."""
+        attr = "_grasper_client_" + service_name.replace("/", "_")
+        client = getattr(node, attr, None)
+        if client is None:
+            client = node.create_client(Empty, service_name)
+            setattr(node, attr, client)
+        return client
+
     @contextmanager
     def _borrow_ros_node(self, name: str):
         if self._ros_node is not None:
@@ -1391,9 +1410,28 @@ class Orchestrator:
         finally:
             node.destroy_node()
 
+    def _ensure_joint_state_cache(self, node: Node) -> None:
+        """Subscribe to /joint_states exactly once (across all QoS profiles,
+        since publishers vary) and keep self._latest_joint_state_map updated
+        for the lifetime of `node`. Replaces the old pattern of every waiter
+        (_wait_for_arm_settled, _joint_state_map, …) creating and destroying
+        its own subscriptions per call, which paid fresh DDS discovery latency
+        at every phase boundary and every gripper action."""
+        if self._joint_state_subs:
+            return
+
+        def _cb(msg):
+            self._latest_joint_state_map.update(dict(zip(msg.name, msg.position)))
+
+        self._joint_state_subs = [
+            node.create_subscription(JointState, "/joint_states", _cb, profile)
+            for profile in JOINT_STATE_QOS_PROFILES
+        ]
+
     def _execution_node(self) -> Node:
         if self._ros_node is None:
             self._ros_node = rclpy.create_node("hpp_trajectory_publisher")
+        self._ensure_joint_state_cache(self._ros_node)
         return self._ros_node
 
     @staticmethod
@@ -1418,13 +1456,17 @@ class Orchestrator:
         return None
 
     def _joint_state_map(self, node_name: str, timeout: float):
-        with self._borrow_ros_node(node_name) as node:
-            joint_state = self._wait_for_topic_message(
-                node, JointState, "/joint_states", timeout, qos=JOINT_STATE_QOS_PROFILES
-            )
-        if joint_state is None:
-            return None
-        return dict(zip(joint_state.name, joint_state.position))
+        """`node_name` is unused (kept for call-site compatibility) — reads
+        from the persistent /joint_states cache shared by the execution node
+        instead of spinning up a throwaway subscription per call."""
+        del node_name
+        node = self._execution_node()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            rclpy.spin_once(node, timeout_sec=0.1)
+            if self._latest_joint_state_map:
+                return dict(self._latest_joint_state_map)
+        return None
 
     def _publish_hold_reference(self, node: Node) -> bool:
         """Re-publish the last trajectory setpoint (with a fresh id) so the
@@ -1469,7 +1511,8 @@ class Orchestrator:
         msgs = []
         idx = self._next_msg_id
         for path, label in paths:
-            q_arr, dq_arr, ddq_arr = self._sample_path(path)
+            time_scale = CARRY_TIME_SCALE if path is self.p3 else TIME_SCALE
+            q_arr, dq_arr, ddq_arr = self._sample_path(path, time_scale=time_scale)
             print(f"  {label}: {len(q_arr)} waypoints")
             for q, dq, ddq in zip(q_arr, dq_arr, ddq_arr):
                 msgs.append(self._build_msg(q, dq, ddq, idx))
@@ -1555,53 +1598,70 @@ class Orchestrator:
     # ── Execution ─────────────────────────────────────────────────────────────
 
     def _wait_for_arm_settled(self, node: Node, timeout: float = ARM_SETTLE_TIMEOUT) -> bool:
-        """Poll /joint_states until the active arm's actual position
-        converges to `self._last_executed_q`'s arm segment (the just-published
-        path's final waypoint), or `timeout` elapses. Publishing the last
-        trajectory message only guarantees the reference was sent, not that
-        the (torque-controlled) arm has physically caught up to it — this
-        confirms it did before the caller moves on to the next phase."""
+        """Poll /joint_states until the active arm's actual end-effector pose
+        converges to the just-published path's final waypoint, or `timeout`
+        elapses. Publishing the last trajectory message only guarantees the
+        reference was sent, not that the (torque-controlled) arm has
+        physically caught up to it — this confirms it did before the caller
+        moves on to the next phase (e.g. a gripper action). Checked via EE
+        pose rather than per-joint error — see the ARM_SETTLE_EE_* comment."""
         if self._last_executed_q is None:
             return True
-        arm_idx = self._active_arm_idx
-        q_target = np.asarray(self._last_executed_q)[arm_idx:arm_idx + 7]
+        q_target = np.asarray(self._last_executed_q)
+        data_target = self.model.createData()
+        pin.forwardKinematics(self.model, data_target, q_target)
+        pin.updateFramePlacements(self.model, data_target)
+        T_target = data_target.oMf[self._ee_frame_id]
+        data_actual = self.model.createData()
 
-        last_q = [None]
-
-        def _cb(msg):
-            js_map = dict(zip(msg.name, msg.position))
-            q = self._arm_joint_state(js_map, self._active_arm_side)
-            if q is not None:
-                last_q[0] = q
-
-        subs = [
-            node.create_subscription(JointState, "/joint_states", _cb, profile)
-            for profile in JOINT_STATE_QOS_PROFILES
-        ]
-        try:
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                self._publish_hold_reference(node)
-                rclpy.spin_once(node, timeout_sec=0.1)
-                if last_q[0] is not None and np.max(np.abs(last_q[0] - q_target)) <= ARM_SETTLE_JOINT_TOLERANCE:
+        last_err = (float("nan"), float("nan"))
+        start = time.monotonic()
+        deadline = start + timeout
+        next_progress = start + 1.0
+        while time.monotonic() < deadline:
+            self._publish_hold_reference(node)
+            rclpy.spin_once(node, timeout_sec=0.1)
+            if self._latest_joint_state_map:
+                q_actual = self._configuration_from_joint_state(
+                    self._latest_joint_state_map, q_seed=self.q_init
+                )
+                pin.forwardKinematics(self.model, data_actual, q_actual)
+                pin.updateFramePlacements(self.model, data_actual)
+                delta = T_target.inverse() * data_actual.oMf[self._ee_frame_id]
+                pos_err_mm = np.linalg.norm(delta.translation) * 1000.0
+                rot_err_deg = np.degrees(np.linalg.norm(pin.log3(delta.rotation)))
+                last_err = (pos_err_mm, rot_err_deg)
+                if (
+                    pos_err_mm <= ARM_SETTLE_EE_POS_TOLERANCE_MM
+                    and rot_err_deg <= ARM_SETTLE_EE_ROT_TOLERANCE_DEG
+                ):
                     return True
-        finally:
-            for sub in subs:
-                node.destroy_subscription(sub)
+            now = time.monotonic()
+            if now >= next_progress:
+                pos_err_mm, rot_err_deg = last_err
+                print(
+                    f"  ... arm settling: EE error {pos_err_mm:.1f} mm / {rot_err_deg:.1f}°"
+                    f" (elapsed {now - start:.1f}/{timeout:.1f}s)"
+                )
+                next_progress = now + 1.0
 
-        max_err = np.max(np.abs(last_q[0] - q_target)) if last_q[0] is not None else float("nan")
+        pos_err_mm, rot_err_deg = last_err
         print(
-            f"WARNING: arm did not settle at the path's final configuration within "
-            f"{timeout}s (max joint error {max_err:.3f} rad)."
+            f"WARNING: arm did not settle at the path's final end-effector pose "
+            f"within {timeout}s (EE error {pos_err_mm:.1f} mm / {rot_err_deg:.1f}°)."
         )
         return False
 
-    def _execute_paths(self, named_paths: list, n_hold: int = 200) -> None:
-        """Build and publish MpcInput messages for the given (path, label) pairs."""
+    def _execute_paths(self, named_paths: list, n_hold: int = 200) -> bool:
+        """Build and publish MpcInput messages for the given (path, label)
+        pairs. Returns True only if the trajectory streamed to completion and
+        the arm was confirmed (via /joint_states) to have settled at its
+        final waypoint — callers must check this before treating the motion
+        as done (e.g. before firing a gripper command)."""
         named_paths = [(path, label) for path, label in named_paths if path is not None]
         if not named_paths:
             print("No paths to execute.")
-            return
+            return True
 
         self._warn_if_robot_far_from_path_start(named_paths)
         print("Sampling trajectories …")
@@ -1631,39 +1691,57 @@ class Orchestrator:
             print("\nExecution interrupted.")
             completed = False
 
-        if completed:
-            self._wait_for_arm_settled(node)
+        if not completed:
+            return False
+        return self._wait_for_arm_settled(node)
 
-    def _execute_phase(self, title: str, path, label: str, n_hold: int) -> None:
+    def _execute_phase(self, title: str, path, label: str, n_hold: int) -> bool:
         print(f"\n=== {title} ===")
-        self._execute_paths([(path, label)], n_hold=n_hold)
+        return self._execute_paths([(path, label)], n_hold=n_hold)
 
-    def _execute_full_sequence(self) -> None:
-        """Execute the complete pick-and-drop sequence with automatic gripper control."""
+    def _execute_full_sequence(self) -> bool:
+        """Execute the complete pick-and-drop sequence with automatic gripper
+        control. Aborts and returns False at the first step that fails to
+        settle/complete — in particular, never calls close_gripper() unless
+        Phase 2 was confirmed to have actually reached the grasp pose."""
+
+        def abort(step: str) -> bool:
+            print(f"\n*** ABORTING sequence: {step} did not complete/settle — "
+                  "see WARNING above. Fix the issue (e.g. sync_from_robot()) "
+                  "and re-run. ***")
+            return False
 
         print("\n=== Opening gripper ===")
-        self.open_gripper()
+        if not self.open_gripper():
+            return abort("initial gripper open")
 
-        self._execute_phase("Phase 1: Approach", self.p1, "p1 (approach)", 50)
-        self._execute_phase("Phase 2: Grasp close-in", self.p2, "p2 (grasp)", 50)
+        if not self._execute_phase("Phase 1: Approach", self.p1, "p1 (approach)", 50):
+            return abort("Phase 1 (approach)")
+        if not self._execute_phase("Phase 2: Grasp close-in", self.p2, "p2 (grasp)", 50):
+            return abort("Phase 2 (grasp) — arm not settled at grasp pose, refusing to close gripper")
 
         print("\n=== Closing gripper ===")
-        self.close_gripper()
+        if not self.close_gripper():
+            return abort("gripper close")
 
         if self.p3 is not None:
-            self._execute_phase("Phase 3: Carry to drop zone", self.p3, "p3 (carry)", 50)
+            if not self._execute_phase("Phase 3: Carry to drop zone", self.p3, "p3 (carry)", 50):
+                return abort("Phase 3 (carry)")
 
         print("\n=== Opening gripper ===")
-        self.open_gripper()
+        if not self.open_gripper():
+            return abort("post-carry gripper open")
 
         if self.p4 is not None:
-            self._execute_phase("Phase 4: Release / retreat", self.p4, "p4 (release)", 200)
+            if not self._execute_phase("Phase 4: Release / retreat", self.p4, "p4 (release)", 200):
+                return abort("Phase 4 (release)")
         else:
             print("\n=== Phase 4: Release / retreat skipped ===")
 
         print("\n=== Pick-and-drop complete ===")
+        return True
 
-    def execute(self, paths=None, auto_gripper: bool = True) -> None:
+    def execute(self, paths=None, auto_gripper: bool = True) -> bool:
         """
         Sample and publish MpcInput messages to the controller.
 
@@ -1675,10 +1753,14 @@ class Orchestrator:
                 as a single continuous trajectory without gripper commands.
         auto_gripper : if True (default) and paths is None, gripper is
                        opened/closed automatically between phases.
+
+        Returns True only if every phase (and, in auto_gripper mode, every
+        gripper action) completed and settled; False if the sequence was
+        aborted partway through.
         """
         if self.p1 is None:
             print("No path available — run plan() first.")
-            return
+            return False
 
         self._next_msg_id = 0
         self._last_hold_msg = None
@@ -1686,13 +1768,11 @@ class Orchestrator:
         self._last_executed_label = None
 
         if paths is not None:
-            self._execute_paths(self._named_paths(paths))
-            return
+            return self._execute_paths(self._named_paths(paths))
 
         if auto_gripper:
-            self._execute_full_sequence()
-        else:
-            self._execute_paths(self._named_paths(self._planned_paths()))
+            return self._execute_full_sequence()
+        return self._execute_paths(self._named_paths(self._planned_paths()))
 
     # ── Robot state sync ──────────────────────────────────────────────────────
 
@@ -1734,82 +1814,36 @@ class Orchestrator:
         controller fed with hold references both while waiting for the
         service to become available and while the call itself is pending —
         gripper actuation happens mid-sequence in execute(), so the arm
-        trajectory reference must not go stale during either wait."""
-        with self._borrow_ros_node(f"hpp_gripper_client_{time.monotonic_ns()}") as node:
-            client = node.create_client(Empty, service_name)
+        trajectory reference must not go stale during either wait. Runs
+        against the persistent execution node (not a throwaway one) so the
+        shared /joint_states cache is available from the very first gripper
+        call, not just once a phase has executed."""
+        node = self._execution_node()
+        client = self._ensure_grasper_client(node, service_name)
 
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                if client.wait_for_service(timeout_sec=min(0.2, DT)):
-                    break
-                self._publish_hold_reference(node)
-            else:
-                print(f"Gripper service '{service_name}' is not available.")
-                return False
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if client.wait_for_service(timeout_sec=min(0.2, DT)):
+                break
+            self._publish_hold_reference(node)
+        else:
+            print(f"Gripper service '{service_name}' is not available.")
+            return False
 
-            future = client.call_async(Empty.Request())
-            self._spin_future_with_hold(node, future)
+        future = client.call_async(Empty.Request())
+        self._spin_future_with_hold(node, future)
 
-            if future.cancelled():
-                print(f"Gripper {action_label} request to '{service_name}' was cancelled.")
-                return False
+        if future.cancelled():
+            print(f"Gripper {action_label} request to '{service_name}' was cancelled.")
+            return False
 
-            exc = future.exception()
-            if exc is not None:
-                print(f"Gripper {action_label} failed via '{service_name}': {exc}")
-                return False
+        exc = future.exception()
+        if exc is not None:
+            print(f"Gripper {action_label} failed via '{service_name}': {exc}")
+            return False
 
-            print(f"Left gripper {action_label} via '{service_name}'.")
-            return True
-
-    def _wait_for_gripper_settled(
-        self, action_label: str, timeout: float = GRIPPER_CONFIRM_TIMEOUT
-    ) -> bool:
-        """Poll /joint_states until the left gripper's primary joint stops
-        moving (no target position — grasp stalls against the object, not
-        0), or `timeout` elapses. Confirms physical completion independently
-        of the grasper service's own (weaker, for 'open') internal wait."""
-        last_position = [None]
-        stable_since = [None]
-
-        def _cb(msg):
-            value = self._lookup_namespaced_value(
-                dict(zip(msg.name, msg.position)), LEFT_GRIPPER_POSITION_JOINT
-            )
-            if value is None:
-                return
-            now = time.monotonic()
-            if (
-                last_position[0] is None
-                or abs(value - last_position[0]) > GRIPPER_STABLE_POSITION_TOLERANCE
-            ):
-                stable_since[0] = now
-            last_position[0] = value
-
-        with self._borrow_ros_node(f"hpp_gripper_settle_{time.monotonic_ns()}") as node:
-            subs = [
-                node.create_subscription(JointState, "/joint_states", _cb, profile)
-                for profile in JOINT_STATE_QOS_PROFILES
-            ]
-            try:
-                deadline = time.time() + timeout
-                while time.time() < deadline:
-                    self._publish_hold_reference(node)
-                    rclpy.spin_once(node, timeout_sec=0.1)
-                    if (
-                        stable_since[0] is not None
-                        and time.monotonic() - stable_since[0] >= GRIPPER_STABLE_DURATION
-                    ):
-                        return True
-            finally:
-                for sub in subs:
-                    node.destroy_subscription(sub)
-
-        print(
-            f"WARNING: gripper {action_label} motion not confirmed settled via "
-            f"/joint_states within {timeout}s."
-        )
-        return False
+        print(f"Left gripper {action_label} via '{service_name}'.")
+        return True
 
     def open_gripper(
         self,
@@ -1817,14 +1851,13 @@ class Orchestrator:
         duration: float = GRIPPER_MOTION_DURATION,
         timeout: float = 5.0,
     ) -> bool:
-        """Open the left gripper in Gazebo and wait until it stops moving."""
+        """Open the left gripper in Gazebo. The grasper service itself blocks
+        until the physical motion completes (or its own timeout elapses), so
+        its return value is the completion signal — see gripper_grasper_srv.py."""
         del position, duration
-        if not self._call_grasper_service(
+        return self._call_grasper_service(
             LEFT_GRIPPER_RELEASE_SERVICE, "open", timeout=timeout
-        ):
-            return False
-        self._wait_for_gripper_settled("open")
-        return True
+        )
 
     def close_gripper(
         self,
@@ -1832,14 +1865,13 @@ class Orchestrator:
         duration: float = GRIPPER_MOTION_DURATION,
         timeout: float = 5.0,
     ) -> bool:
-        """Close the left gripper in Gazebo and wait until it stops moving."""
+        """Close the left gripper in Gazebo. The grasper service itself blocks
+        until the physical motion completes (or its own timeout elapses), so
+        its return value is the completion signal — see gripper_grasper_srv.py."""
         del position, duration
-        if not self._call_grasper_service(
+        return self._call_grasper_service(
             LEFT_GRIPPER_GRASP_SERVICE, "close", timeout=timeout
-        ):
-            return False
-        self._wait_for_gripper_settled("close")
-        return True
+        )
 
     # ── Object pose update ────────────────────────────────────────────────────
 
@@ -2257,6 +2289,7 @@ class Orchestrator:
 
     # ── Combined ──────────────────────────────────────────────────────────────
 
-    def plan_and_execute(self, max_attempts: int = 100):
+    def plan_and_execute(self, max_attempts: int = 100) -> bool:
         if self.plan(max_attempts=max_attempts):
-            self.execute()
+            return self.execute()
+        return False
