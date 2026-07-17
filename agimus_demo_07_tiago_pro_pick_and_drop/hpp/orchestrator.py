@@ -68,6 +68,7 @@ GROUND_SRDF = os.path.join(_HPP_DIR, "ground.srdf")
 GROUND_URDF = os.path.join(_PKG_DIR, "urdf", "ground.urdf")
 TABLE_SRDF  = os.path.join(_HPP_DIR, "table.srdf")
 TABLE_URDF  = os.path.join(_PKG_DIR, "urdf", "table.urdf")
+TABLE_OFFSET_X = 0.85   # shift toward robot (m)
 
 _CFG_FILE = os.path.join(_PKG_DIR, "config", "hpp_orchestrator_params.yaml")
 with open(_CFG_FILE) as _f:
@@ -129,6 +130,40 @@ def _resolve_object_asset_path(base_dir: str, extension: str, obj_name: str) -> 
     )
 
 
+def _patch_viser_tab_group_remove_bug() -> None:
+    """viser's GuiTabGroupHandle.remove() marks itself removed before removing
+    its child tabs, but each child tab.remove() writes back to the (now
+    "removed") parent's _tab_labels/_tab_icons_html/_tab_handles props, which
+    raises "Cannot assign to '_tab_labels' on a removed GuiTabGroupHandle."
+    This hits us every time pyhpp_viser.Viewer.initViewer() calls
+    viewer.gui.reset() to swap in a newly detected object's model. Patch the
+    method so children are removed before the parent is marked removed."""
+    from viser._gui_handles import GuiTabGroupHandle
+    from viser._messages import GuiRemoveMessage
+
+    if getattr(GuiTabGroupHandle.remove, "_agimus_patched", False):
+        return
+
+    def remove(self) -> None:
+        if self._impl.removed:
+            import warnings
+            warnings.warn(
+                f"Attempted to remove an already removed {type(self).__name__}.",
+                stacklevel=2,
+            )
+            return
+        for tab in tuple(self._tab_handles):
+            tab.remove()
+        self._impl.removed = True
+        gui_api = self._impl.gui_api
+        gui_api._websock_interface.queue_message(GuiRemoveMessage(self._impl.uuid))
+        parent = gui_api._container_handle_from_uuid[self._impl.parent_container_id]
+        parent._children.pop(self._impl.uuid)
+
+    remove._agimus_patched = True
+    GuiTabGroupHandle.remove = remove
+
+
 OBJ_INIT_POS = np.array([_obj_cfg["x"], _obj_cfg["y"], _obj_cfg["z"]])
 
 LEFT_ARM_TUCK  = _cfg["tuck"]["left_arm"]
@@ -144,12 +179,20 @@ W_COLLISION = _w["w_collision"]
 W_FRAME_TRANS = np.array(_w["w_frame_trans"])
 W_FRAME_ROT   = np.array(_w["w_frame_rot"])
 
-GRIPPER_OPEN_POSITION = 0.07
+GRIPPER_OPEN_POSITION = 0.07     # m, fingertip travel used as the HPP planning target
 GRIPPER_CLOSED_POSITION = 0.0
-GRIPPER_MOTION_DURATION = 1.5
-HPP_FIXED_JOINT_EPS = 1e-6
+GRIPPER_MOTION_DURATION = 1.5     # s, unused delay kept for API compatibility (see open/close_gripper)
+LEFT_GRIPPER_POSITION_JOINT = "gripper_left_finger_joint"  # primary actuated joint (multiplier 1.0), used to confirm physical motion has stopped
+GRIPPER_STABLE_POSITION_TOLERANCE = 0.002  # m, max drift between samples to consider the gripper stopped
+GRIPPER_STABLE_DURATION = 0.3              # s, how long position must stay within tolerance before calling it settled
+GRIPPER_CONFIRM_TIMEOUT = 3.0              # s, max extra wait for /joint_states to confirm settling
+HPP_FIXED_JOINT_EPS = 1e-6        # +/- bound width used to "freeze" a joint for HPP planning
 TABLE_COLLISION_MAX_LIFT = 0.10   # max upward correction (m) before giving up
 TABLE_COLLISION_STEP     = 0.005  # z increment per collision-check iteration (m)
+# Each gripper is driven in HPP by a single open/close scalar (0=closed,
+# GRIPPER_OPEN_POSITION=open), but every finger joint in the URDF has its own
+# range and sign. These multipliers convert that one scalar into a per-joint
+# target so the whole gripper closes as one rigid mechanism.
 LEFT_GRIPPER_HPP_JOINT_MULTIPLIERS = (
     ("gripper_left_finger_joint", 1.0),
     ("gripper_left_left_finger_joint", 1.0),
@@ -183,8 +226,21 @@ DEFAULT_FIXED_JOINT_VALUES = (
     ("head_1_joint", 0.0),
     ("head_2_joint", 0.0),
 )
+# Thresholds for warning that the robot's actual state has drifted from a
+# planned path's start point (see _warn_if_robot_far_from_path_start) —
+# usually a sign that plan() was run against a stale q_init.
 PATH_START_EE_WARN_MM = 100.0
 PATH_START_JOINT_WARN_RAD = 0.35
+# Publishing the last trajectory point only means the reference has been
+# sent — the torque-controlled arm can still be catching up to it. These
+# bound how long _wait_for_arm_settled waits for /joint_states to confirm
+# the arm actually reached a path's final configuration before the next
+# phase (e.g. a gripper action) begins.
+ARM_SETTLE_JOINT_TOLERANCE = 0.03  # rad, max per-joint error to consider the arm "arrived"
+ARM_SETTLE_TIMEOUT = 10.0           # s, max extra wait for /joint_states to confirm arrival
+# /joint_states may be published with different QoS settings depending on
+# the source node, so we subscribe with all three and take whichever message
+# arrives first.
 JOINT_STATE_QOS_PROFILES = (
     QoSProfile(
         depth=1,
@@ -263,6 +319,13 @@ class Orchestrator:
                 f"Timed out after {timeout}s waiting for /robot_description."
             )
         return urdf_str
+
+    # ── Namespace resolution ──────────────────────────────────────────────
+    # Joint/frame/gripper names may or may not carry a "tiago_pro/" prefix,
+    # depending on whether they come from the loaded Pinocchio model, the
+    # HPP gripper registry, or a live /joint_states message. The helpers
+    # below try both the prefixed and unprefixed form (and, failing that,
+    # any name in the model ending in "/<candidate>") before giving up.
 
     @staticmethod
     def _name_candidates(name: str) -> list:
@@ -396,9 +459,14 @@ class Orchestrator:
         ])
 
     def _set_joint_configuration_value(self, q: np.ndarray, joint_name: str, value: float) -> None:
+        """Write `value` into q at `joint_name`'s slot, in whatever encoding
+        Pinocchio uses for that joint type."""
         resolved_name = self._resolve_joint_name(joint_name)
         joint = self.model.joints[self.model.getJointId(resolved_name)]
         if joint.nq == 2 and joint.nv == 1:
+            # Continuous (unbounded revolute) joints are stored as [cos, sin]
+            # in the configuration vector, not as a raw angle, so Pinocchio
+            # can represent them without a +/-pi wraparound discontinuity.
             q[joint.idx_q:joint.idx_q + 2] = [np.cos(value), np.sin(value)]
         else:
             q[joint.idx_q:joint.idx_q + joint.nq] = [value]
@@ -460,6 +528,9 @@ class Orchestrator:
         return q
 
     def _as_full_configuration(self, q_ref) -> np.ndarray:
+        """Accept either a full robot configuration or just the 7 active-arm
+        values, and return a full configuration either way — lets callers
+        like compare_pose() pass either form."""
         q_ref = np.array(q_ref, copy=True)
         if q_ref.ndim != 1:
             raise ValueError(
@@ -471,8 +542,8 @@ class Orchestrator:
 
         if q_ref.shape[0] == len(self._active_arm_joint_names):
             q_full = self.q_init.copy()
-            ai = self._active_arm_idx
-            q_full[ai:ai + q_ref.shape[0]] = q_ref
+            arm_idx = self._active_arm_idx
+            q_full[arm_idx:arm_idx + q_ref.shape[0]] = q_ref
             return q_full
 
         raise ValueError(
@@ -480,6 +551,10 @@ class Orchestrator:
         )
 
     def _apply_locked_defaults_to_q(self, q: np.ndarray) -> None:
+        """Fill in everything that ISN'T actively planned: fixed base/torso/
+        head joints, the excluded gripper-finger joints, the active arm's
+        home posture, and the other arm's tucked/locked posture. Used to
+        build q_init and to re-seed it when the robot state is resynced."""
         for joint_name, value in self._fixed_joint_values.items():
             try:
                 self._set_joint_configuration_value(q, joint_name, value)
@@ -493,6 +568,37 @@ class Orchestrator:
             self._set_joint_configuration_value(q, joint_name, value)
 
     def _setup_model(self):
+        """Build self.robot/model from scratch (or rebuild it when the
+        detected object changes — see update_object_pose_from_happypose)."""
+        self._load_urdf_models()
+        self._resolve_joint_topology()
+
+        self._set_obj_bounds(*OBJ_INIT_POS)
+        self._set_table_bounds()
+
+        self.q_init = pin.neutral(self.model).copy()
+        obj_idx = self._obj_idx
+        table_idx = self._table_idx
+        self._active_arm_home = list(LEFT_ARM_TUCK)
+        self._other_arm_lock_values = (
+            list(RIGHT_ARM_TUCK) if self._other_arm_idx is not None else []
+        )
+        # Init: active arm at home, graph-locked joints on-manifold, and the
+        # HPP-excluded gripper fingers fixed to the Gazebo-controlled open pose.
+        self._apply_locked_defaults_to_q(self.q_init)
+        self.q_init[obj_idx:obj_idx+3] = OBJ_INIT_POS
+        self.q_init[obj_idx+3:obj_idx+7] = [0., 0., 0., 1.]  # identity quaternion
+        self.q_init[table_idx:table_idx+3] = [TABLE_OFFSET_X, 0, 0]
+        self.q_init[table_idx+3:table_idx+7] = [0., 0., 0., 1.]  # identity quaternion
+
+        self._pin_data = self.model.createData()
+        self._ee_frame_id = self.model.getFrameId(self._ee_frame_name)
+        if self._ee_frame_id == self.model.nframes:
+            raise RuntimeError(f"Frame '{self._ee_frame_name}' not found in model")
+
+    def _load_urdf_models(self):
+        """Load the robot (from the live /robot_description), ground, table,
+        and the configured object's URDF/SRDF pair into a fresh HPP Device."""
         urdf_str = self._fetch_robot_urdf()
         _tmp = tempfile.NamedTemporaryFile(suffix=".urdf", delete=False, mode="w")
         _tmp.write(urdf_str)
@@ -512,11 +618,10 @@ class Orchestrator:
             GROUND_URDF, GROUND_SRDF,
             pin.SE3.Identity(),
         )
-        TABLE_OFFSET_X =  0.85   # shift toward robot (m)
         urdf.loadModel(
-            robot, 0, "table", "anchor",
+            robot, 0, "table", "freeflyer",
             TABLE_URDF, TABLE_SRDF,
-            pin.SE3(np.eye(3), np.array([TABLE_OFFSET_X, 0, 0])),
+            pin.SE3.Identity(),
         )
         self._obj_srdf = _resolve_object_asset_path(_HPP_DIR, ".srdf", self._obj_name)
         self._obj_urdf = _resolve_object_asset_path(
@@ -529,8 +634,7 @@ class Orchestrator:
         )
 
         self.robot = robot
-        model = robot.model()
-        self.model = model
+        self.model = robot.model()
 
         # Grasp candidates come straight from whatever handles are defined
         # in the object's SRDF, so this works unmodified for any T-LESS
@@ -539,6 +643,13 @@ class Orchestrator:
             entry.key() for entry in robot.handles()
             if entry.key().startswith(f"{self._obj_name}/")
         )
+
+    def _resolve_joint_topology(self):
+        """Resolve gripper/frame/arm joint names in the loaded model, build
+        the HPP-excluded gripper-finger targets, and record the active
+        (left) vs other (right) arm indices. The left arm is the only one
+        used for picking — see module docstring."""
+        model = self.model
 
         def _idx(name):
             joint_name = self._resolve_joint_name(name)
@@ -562,6 +673,9 @@ class Orchestrator:
                 GRIPPER_OPEN_POSITION, RIGHT_GRIPPER_HPP_JOINT_MULTIPLIERS
             )
         )
+        # Gripper fingers are driven directly by the real gripper mechanism
+        # (see open_gripper/close_gripper) rather than planned by HPP, so
+        # freeze them here at their open target.
         for joint_name, value in self._gripper_joint_targets.items():
             self._exclude_joint_from_hpp_planning(joint_name, value)
         self._left_arm_idx  = _idx(self._left_arm_joint_names[0])
@@ -570,6 +684,7 @@ class Orchestrator:
             if self._right_arm_joint_names else None
         )
         self._obj_idx       = _idx(f"{self._obj_name}/root_joint")
+        self._table_idx     = _idx("table/root_joint")
 
         # Use LEFT arm for picking (has pal-pro-gripper with actual gripper mechanism)
         self._active_arm_idx = self._left_arm_idx
@@ -579,31 +694,29 @@ class Orchestrator:
         self._other_arm_side = "right" if self._right_arm_joint_names else None
         self._other_arm_joint_names = self._right_arm_joint_names
 
-        self._set_obj_bounds(*OBJ_INIT_POS)
-
-        self.q_init = pin.neutral(model).copy()
-        oi = self._obj_idx
-        self._active_arm_home = list(LEFT_ARM_TUCK)
-        self._other_arm_lock_values = (
-            list(RIGHT_ARM_TUCK) if self._other_arm_idx is not None else []
-        )
-        # Init: active arm at home, graph-locked joints on-manifold, and the
-        # HPP-excluded gripper fingers fixed to the Gazebo-controlled open pose.
-        self._apply_locked_defaults_to_q(self.q_init)
-        self.q_init[oi:oi+3] = OBJ_INIT_POS
-        self.q_init[oi+3:oi+7] = [0., 0., 0., 1.]  # identity quaternion
-
-        self._pin_data = model.createData()
-        self._ee_frame_id = model.getFrameId(self._ee_frame_name)
-        if self._ee_frame_id == model.nframes:
-            raise RuntimeError(f"Frame '{self._ee_frame_name}' not found in model")
-
     def _set_obj_bounds(self, x, y, z, margin: float = 1.0):
         """Lock object position with tight bounds so HPP cannot move it freely."""
         self.robot.setJointBounds(f"{self._obj_name}/root_joint", [
             x - margin, x + margin,
             y - margin, y + margin,
             z - margin, z + margin,
+            -float("Inf"), float("Inf"),
+            -float("Inf"), float("Inf"),
+            -float("Inf"), float("Inf"),
+            -float("Inf"), float("Inf"),
+        ])
+
+    def _set_table_bounds(self, margin: float = 0.001):
+        """Give the table's freeflyer root joint a tight but finite
+        translation box, so the raw configuration shooter (which requires
+        genuinely bounded limits to sample from) can draw from it; actual
+        pinning — including rotation, which bounds cannot constrain on a
+        freeflyer — is done by the LockedJoint added in `_locked_joints()`."""
+        x = TABLE_OFFSET_X
+        self.robot.setJointBounds("table/root_joint", [
+            x - margin, x + margin,
+            -margin, margin,
+            -margin, margin,
             -float("Inf"), float("Inf"),
             -float("Inf"), float("Inf"),
             -float("Inf"), float("Inf"),
@@ -625,63 +738,34 @@ class Orchestrator:
         factory.setObjects([self._obj_name], [self._handle_names], [[]])
         factory.generate()
 
-        gripper = self._gripper_name
+        self._build_grasp_candidates(graph)
 
-        # One (approach, grasp, carry, release) transition quadruple per
-        # handle. Vision can't tell us which handle is actually reachable
-        # (e.g. the object detected flipped ~180 deg), so plan() tries each
-        # candidate and picks whichever one actually plans — see
-        # _select_best_handle().
-        self._grasp_candidates = []
-        for handle in self._handle_names:
-            transition_approach = graph.getTransition(f"{gripper} > {handle} | f_01")
-            transition_grasp = graph.getTransition(f"{gripper} > {handle} | f_12")
-            self._grasp_candidates.append({
-                "name": handle,
-                "approach": transition_approach,
-                "grasp": transition_grasp,
-                # Loop edge at grasped state — used for the carry phase.
-                "carry": self._find_carry_edge(graph, transition_grasp),
-                # Reverse edge from grasped back to pre-grasp — used for
-                # release at drop zone.
-                "release": self._find_release_edge(graph, transition_grasp),
-            })
-
-        # Default to the first candidate; _select_best_handle() (called from
-        # plan()) overrides this once actual reachability is known.
-        default = self._grasp_candidates[0]
-        self._transition_approach = default["approach"]
-        self._transition_grasp    = default["grasp"]
-        self._transition_carry    = default["carry"]
-        self._transition_release  = default["release"]
-
-        _cts = ComparisonTypes()
-        _cts[:] = [ComparisonType.EqualToZero]
-
-        def _lock(joint_name, value):
-            joint_name = self._resolve_joint_name(joint_name)
-            j = model.joints[model.getJointId(joint_name)]
-            if j.nq == 2 and j.nv == 1:
-                locked_val = np.array([np.cos(value), np.sin(value)])
-            else:
-                locked_val = np.array([value])
-            return LockedJoint(robot, joint_name, locked_val, _cts)
-
-        locked = []
-        for joint_name, value in self._fixed_joint_values.items():
-            try:
-                locked.append(_lock(joint_name, value))
-            except KeyError:
-                pass
-        # Lock the inactive arm when the robot description exposes one.
-        for joint_name, val in zip(self._other_arm_joint_names, self._other_arm_lock_values):
-            locked.append(_lock(joint_name, val))
-
+        locked = self._locked_joints(robot, model)
         graph.addNumericalConstraintsToGraph(locked)
 
-        sm = SecurityMargins(problem, factory, ["tiago_pro", self._obj_name], robot)
-        sm.setSecurityMarginBetween("tiago_pro", self._obj_name, 0.0)
-        sm.apply()
+        # Robot/object collision margin is 0 by default; grasp/carry
+        # transitions below additionally disable it outright so the gripper
+        # can actually close in on the handle.
+        security_margins = SecurityMargins(
+            problem, factory, ["tiago_pro", self._obj_name, "table"], robot
+        )
+        security_margins.setSecurityMarginBetween("tiago_pro", self._obj_name, 0.0)
+        security_margins.setSecurityMarginBetween("tiago_pro", "table", 0.05)
+        security_margins.apply()
+
+        # The active gripper must approach within a few centimeters of the
+        # table surface to grasp objects resting on it, so exempt just the
+        # gripper itself (wrist joint + fingers — the palm/housing geometry
+        # is rigidly fixed to, and thus merged into, the wrist joint's body)
+        # from the table margin above; the rest of the arm (e.g. the elbow)
+        # keeps the 5cm clearance.
+        gripper_table_exempt_joints = [
+            self._resolve_joint_name("arm_left_7_joint"),
+            *(name for name in self._gripper_joint_targets if "gripper_left" in name),
+        ]
+        for edge in graph.getTransitions():
+            for jname in gripper_table_exempt_joints:
+                graph.setSecurityMarginForTransition(edge, jname, "table/root_joint", 0.0)
 
         # Disable collision between robot and object in grasp/carry transitions
         # so the gripper can actually reach the handle — for every handle.
@@ -700,6 +784,80 @@ class Orchestrator:
         self.problem = problem
         self.problem.addConfigValidation("CollisionValidation")
         self.graph   = graph
+
+    def _build_grasp_candidates(self, graph):
+        """Build one (approach, grasp, carry, release) transition quadruple
+        per object handle. Vision can't tell us which handle is actually
+        reachable (e.g. the object detected flipped ~180 deg), so plan()
+        tries each candidate and picks whichever one actually plans — see
+        _select_best_handle(). Defaults self._transition_* to the first
+        candidate; _select_best_handle() overrides this once actual
+        reachability is known."""
+        gripper = self._gripper_name
+
+        self._grasp_candidates = []
+        for handle in self._handle_names:
+            transition_approach = graph.getTransition(f"{gripper} > {handle} | f_01")
+            transition_grasp = graph.getTransition(f"{gripper} > {handle} | f_12")
+            self._grasp_candidates.append({
+                "name": handle,
+                "approach": transition_approach,
+                "grasp": transition_grasp,
+                # Loop edge at grasped state — used for the carry phase.
+                "carry": self._find_carry_edge(graph, transition_grasp),
+                # Reverse edge from grasped back to pre-grasp — used for
+                # release at drop zone.
+                "release": self._find_release_edge(graph, transition_grasp),
+            })
+
+        default = self._grasp_candidates[0]
+        self._transition_approach = default["approach"]
+        self._transition_grasp    = default["grasp"]
+        self._transition_carry    = default["carry"]
+        self._transition_release  = default["release"]
+
+    def _locked_joints(self, robot, model):
+        """Build the LockedJoint list for everything HPP should treat as
+        fixed while planning: the fixed base/torso/head joints, the
+        inactive arm's tucked posture, and the static table."""
+        _cts = ComparisonTypes()
+        _cts[:] = [ComparisonType.EqualToZero]
+
+        def _lock(joint_name, value):
+            joint_name = self._resolve_joint_name(joint_name)
+            j = model.joints[model.getJointId(joint_name)]
+            if j.nq == 2 and j.nv == 1:
+                locked_val = np.array([np.cos(value), np.sin(value)])
+            else:
+                locked_val = np.array([value])
+            return LockedJoint(robot, joint_name, locked_val, _cts)
+
+        def _lock_full_config(joint_name, reference_config):
+            """Lock a joint to a full reference configuration rather than a
+            single scalar value — needed for a freeflyer, whose rotation
+            part `setJointBounds` cannot pin (Pinocchio always samples a
+            freeflyer's orientation uniformly over SO(3), ignoring whatever
+            bounds are set on its quaternion components)."""
+            joint_name = self._resolve_joint_name(joint_name)
+            j = model.joints[model.getJointId(joint_name)]
+            cts = ComparisonTypes()
+            cts[:] = [ComparisonType.EqualToZero] * j.nv
+            return LockedJoint(robot, joint_name, np.array(reference_config), cts)
+
+        locked = []
+        for joint_name, value in self._fixed_joint_values.items():
+            try:
+                locked.append(_lock(joint_name, value))
+            except KeyError:
+                pass
+        # Lock the inactive arm when the robot description exposes one.
+        for joint_name, val in zip(self._other_arm_joint_names, self._other_arm_lock_values):
+            locked.append(_lock(joint_name, val))
+        locked.append(_lock_full_config(
+            "table/root_joint", [TABLE_OFFSET_X, 0, 0, 0., 0., 0., 1.]
+        ))
+
+        return locked
 
     @staticmethod
     def _find_transition_between(graph, source_state, target_state, found_label: str):
@@ -819,6 +977,26 @@ class Orchestrator:
         )
         return path
 
+    def _generate_valid_config(self, transition, q_from, q_seed, validator=None):
+        """Project q_seed onto `transition`'s manifold from q_from, then run
+        collision validation on the result. Returns (generated, valid, q,
+        err): `generated` is whether the projection itself converged, `valid`
+        is whether the projected config also passed collision validation
+        (always False when not generated), and `q` is that config (None
+        unless both are True). `err` is the projection's own error estimate —
+        returned even when `generated` is False, since some callers report it
+        in diagnostics. Pass `validator` to reuse an already-created
+        pathValidation (e.g. across many samples in a loop) instead of
+        creating a new one on every call."""
+        generated, q_candidate, err = self.graph.generateTargetConfig(
+            transition, q_from, q_seed
+        )
+        if not generated:
+            return False, False, None, err
+        validator = validator or transition.pathValidation()
+        valid, _ = validator.validateConfiguration(q_candidate)
+        return True, valid, (q_candidate if valid else None), err
+
     def _sample_grasp_candidate(
         self, approach_transition, grasp_transition,
         shooter, approach_validator, grasp_validator,
@@ -828,19 +1006,26 @@ class Orchestrator:
         None) if the pre-grasp/grasp config couldn't be generated or is in
         collision — no path planning is attempted here."""
         q = shooter.shoot()
-        res, qpg, err = self.graph.generateTargetConfig(
-            approach_transition, self.q_init, q
+        _generated, ok, qpg, err = self._generate_valid_config(
+            approach_transition, self.q_init, q, approach_validator
         )
-        if not res or not approach_validator.validateConfiguration(qpg)[0]:
+        if not ok:
             return False, None, None, None, None
 
-        res, qg, qg_err = self.graph.generateTargetConfig(grasp_transition, qpg, qpg)
-        if not res or not grasp_validator.validateConfiguration(qg)[0]:
+        _generated, ok, qg, qg_err = self._generate_valid_config(
+            grasp_transition, qpg, qpg, grasp_validator
+        )
+        if not ok:
             return False, None, None, None, None
 
         return True, qpg, qg, err, qg_err
 
     def _find_approach_path(self, planner, q_goal, max_attempts: int):
+        """Sample pre-grasp/grasp config pairs until one both exists
+        collision-free (_sample_grasp_candidate) AND is actually reachable by
+        a planned path from q_init — a candidate can be valid in isolation
+        but still unreachable within the planner's iteration budget, so on
+        that specific failure we keep sampling instead of giving up."""
         shooter = self.problem.configurationShooter()
         approach_validator = self._transition_approach.pathValidation()
         grasp_validator = self._transition_grasp.pathValidation()
@@ -867,6 +1052,8 @@ class Orchestrator:
                     self.q_init, qpg, "p1 (approach)"
                 )
             except RuntimeError as exc:
+                # Only swallow the "gave up searching" case; any other
+                # RuntimeError is a real error and should propagate.
                 if not self._is_iteration_limit_error(exc):
                     raise
                 print(
@@ -900,6 +1087,11 @@ class Orchestrator:
         shortcut,
         spline_opt,
     ):
+        """Plan p3 (carry to drop zone) and p4 (release/retreat), if a carry
+        edge exists. Every failure point degrades gracefully rather than
+        aborting the whole plan: no carry edge, no reachable drop config, or
+        a planning exception all fall back to `fallback_p4` (the reversed p2
+        computed by the caller) with p3 left as None."""
         p3 = None
         p4 = fallback_p4
         if self._transition_carry is None:
@@ -1049,24 +1241,21 @@ class Orchestrator:
         The carry transition updates the object pose consistently with the grasp.
         """
         q_seed = np.array(qg).copy()
-        ai = self._active_arm_idx
-        q_seed[ai:ai+7] = DROP_ARM_CFG
+        arm_idx = self._active_arm_idx
+        q_seed[arm_idx:arm_idx+7] = DROP_ARM_CFG
 
         if self._transition_carry is None:
             return q_seed
 
-        res, q_drop, err = self.graph.generateTargetConfig(
+        generated, valid, q_drop, err = self._generate_valid_config(
             self._transition_carry, qg, q_seed
         )
-        if not res:
+        if not generated:
             print(
                 f"  Failed to project drop config onto carry manifold (err={err:.2e}) — skipping p3."
             )
             return None
-
-        pv = self._transition_carry.pathValidation()
-        ok, _ = pv.validateConfiguration(q_drop)
-        if not ok:
+        if not valid:
             print("  Projected drop config is not valid for carry — skipping p3.")
             return None
         return q_drop
@@ -1083,18 +1272,17 @@ class Orchestrator:
         deterministic_seeds = [np.array(q_drop).copy()]
         if self.qpg is not None:
             q_seed = np.array(q_drop).copy()
-            ai = self._active_arm_idx
-            q_seed[ai:ai+7] = np.array(self.qpg)[ai:ai+7]
+            arm_idx = self._active_arm_idx
+            q_seed[arm_idx:arm_idx+7] = np.array(self.qpg)[arm_idx:arm_idx+7]
             deterministic_seeds.append(q_seed)
 
         for idx, q_seed in enumerate(deterministic_seeds, start=1):
-            res, q_cand, err = self.graph.generateTargetConfig(
-                self._transition_release, q_drop, q_seed
+            generated, valid, q_cand, err = self._generate_valid_config(
+                self._transition_release, q_drop, q_seed, release_validator
             )
-            if not res:
+            if not generated:
                 continue
-            res, _ = release_validator.validateConfiguration(q_cand)
-            if res:
+            if valid:
                 print(
                     f"  q_predrop found from deterministic seed {idx}, err={err:.2e}"
                 )
@@ -1103,13 +1291,12 @@ class Orchestrator:
         shooter = self.problem.configurationShooter()
         for attempt in range(max_attempts):
             q = shooter.shoot()
-            res, q_cand, err = self.graph.generateTargetConfig(
-                self._transition_release, q_drop, q
+            generated, valid, q_cand, err = self._generate_valid_config(
+                self._transition_release, q_drop, q, release_validator
             )
-            if not res:
+            if not generated:
                 continue
-            res, _ = release_validator.validateConfiguration(q_cand)
-            if res:
+            if valid:
                 print(f"  q_predrop found at attempt {attempt + 1}, err={err:.2e}")
                 return q_cand
         print(f"  WARNING: no valid pre-drop config found in {max_attempts} attempts.")
@@ -1118,12 +1305,17 @@ class Orchestrator:
     # ── Path sampling ─────────────────────────────────────────────────────────
 
     def _sample_path(self, path):
+        """Resample an HPP path at DT intervals (sped up by TIME_SCALE) into
+        arm-only position/velocity/acceleration arrays for the MPC
+        controller. HPP paths only give positions, so velocity/acceleration
+        are derived by finite differences; the last row of each is just
+        repeated once to keep all three arrays the same length."""
         tr = path.timeRange()
         t_min, t_max = tr.first, tr.second
         n = max(2, int((t_max - t_min) * TIME_SCALE / DT))
         times = np.linspace(t_min, t_max, n)
-        ai = self._active_arm_idx
-        q_arr = np.array([np.asarray(path.eval(t)[0])[ai:ai+7] for t in times])
+        arm_idx = self._active_arm_idx
+        q_arr = np.array([np.asarray(path.eval(t)[0])[arm_idx:arm_idx+7] for t in times])
         dq_arr = np.diff(q_arr, axis=0) / DT
         dq_arr = np.vstack([dq_arr, dq_arr[-1]])
         ddq_arr = np.diff(dq_arr, axis=0) / DT
@@ -1136,13 +1328,17 @@ class Orchestrator:
         # HPP planning state here would inject the torso lift into the EE pose and
         # shift the controller reference about 300 mm upward.
         q_full = pin.neutral(self.model)
-        ai = self._active_arm_idx
-        q_full[ai:ai+7] = q_arm
+        arm_idx = self._active_arm_idx
+        q_full[arm_idx:arm_idx+7] = q_arm
         pin.forwardKinematics(self.model, self._pin_data, q_full)
         pin.updateFramePlacements(self.model, self._pin_data)
         return self._pin_data.oMf[self._ee_frame_id].copy()
 
     def _build_msg(self, q, dq, ddq, msg_id):
+        """Build one MpcInput: joint-space targets/weights for the 7 active
+        arm joints, plus a Cartesian end-effector target/weights (computed
+        via forward kinematics) that the MPC controller blends in for
+        task-space tracking."""
         msg = MpcInput()
         msg.id           = msg_id
         msg.q            = q.tolist()
@@ -1231,6 +1427,10 @@ class Orchestrator:
         return dict(zip(joint_state.name, joint_state.position))
 
     def _publish_hold_reference(self, node: Node) -> bool:
+        """Re-publish the last trajectory setpoint (with a fresh id) so the
+        MPC controller keeps seeing a live reference while we're blocked
+        waiting on something else (a service call, a future). Returns False
+        if execute() hasn't run yet and there's nothing to hold."""
         if self._last_hold_msg is None:
             return False
 
@@ -1242,6 +1442,10 @@ class Orchestrator:
         return True
 
     def _spin_future_with_hold(self, node: Node, future) -> None:
+        """Spin `node` until `future` resolves, publishing a hold reference
+        at DT intervals in the meantime — used while waiting on ROS service
+        calls (e.g. gripper open/close) so the controller doesn't go quiet
+        mid-sequence."""
         next_hold_time = time.monotonic()
         while not future.done():
             if self._last_hold_msg is not None:
@@ -1256,6 +1460,12 @@ class Orchestrator:
             rclpy.spin_once(node, timeout_sec=timeout_sec)
 
     def _build_messages(self, paths: list, n_hold: int = 200) -> list:
+        """Sample each (path, label) pair into MpcInput messages, then
+        append n_hold extra messages at the final position with zero
+        velocity/acceleration. Without this padding, the controller would
+        stop receiving new setpoints the instant the path ends and could
+        lose tracking; the hold points give it a stable target to settle
+        into instead."""
         msgs = []
         idx = self._next_msg_id
         for path, label in paths:
@@ -1317,8 +1527,8 @@ class Orchestrator:
 
         path, label = named_paths[0]
         q_start = np.array(path.eval(path.timeRange().first)[0], copy=True)
-        ai = self._active_arm_idx
-        joint_err = np.max(np.abs(q_start[ai:ai+7] - q_actual[ai:ai+7]))
+        arm_idx = self._active_arm_idx
+        joint_err = np.max(np.abs(q_start[arm_idx:arm_idx+7] - q_actual[arm_idx:arm_idx+7]))
 
         data_start = self.model.createData()
         data_actual = self.model.createData()
@@ -1344,6 +1554,48 @@ class Orchestrator:
 
     # ── Execution ─────────────────────────────────────────────────────────────
 
+    def _wait_for_arm_settled(self, node: Node, timeout: float = ARM_SETTLE_TIMEOUT) -> bool:
+        """Poll /joint_states until the active arm's actual position
+        converges to `self._last_executed_q`'s arm segment (the just-published
+        path's final waypoint), or `timeout` elapses. Publishing the last
+        trajectory message only guarantees the reference was sent, not that
+        the (torque-controlled) arm has physically caught up to it — this
+        confirms it did before the caller moves on to the next phase."""
+        if self._last_executed_q is None:
+            return True
+        arm_idx = self._active_arm_idx
+        q_target = np.asarray(self._last_executed_q)[arm_idx:arm_idx + 7]
+
+        last_q = [None]
+
+        def _cb(msg):
+            js_map = dict(zip(msg.name, msg.position))
+            q = self._arm_joint_state(js_map, self._active_arm_side)
+            if q is not None:
+                last_q[0] = q
+
+        subs = [
+            node.create_subscription(JointState, "/joint_states", _cb, profile)
+            for profile in JOINT_STATE_QOS_PROFILES
+        ]
+        try:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                self._publish_hold_reference(node)
+                rclpy.spin_once(node, timeout_sec=0.1)
+                if last_q[0] is not None and np.max(np.abs(last_q[0] - q_target)) <= ARM_SETTLE_JOINT_TOLERANCE:
+                    return True
+        finally:
+            for sub in subs:
+                node.destroy_subscription(sub)
+
+        max_err = np.max(np.abs(last_q[0] - q_target)) if last_q[0] is not None else float("nan")
+        print(
+            f"WARNING: arm did not settle at the path's final configuration within "
+            f"{timeout}s (max joint error {max_err:.3f} rad)."
+        )
+        return False
+
     def _execute_paths(self, named_paths: list, n_hold: int = 200) -> None:
         """Build and publish MpcInput messages for the given (path, label) pairs."""
         named_paths = [(path, label) for path, label in named_paths if path is not None]
@@ -1368,6 +1620,7 @@ class Orchestrator:
             f"Publishing {len(messages)} trajectory points at {1/DT:.0f} Hz …"
         )
 
+        completed = True
         try:
             for msg in messages:
                 pub.publish(msg)
@@ -1376,6 +1629,10 @@ class Orchestrator:
             node.get_logger().info("Trajectory fully published.")
         except KeyboardInterrupt:
             print("\nExecution interrupted.")
+            completed = False
+
+        if completed:
+            self._wait_for_arm_settled(node)
 
     def _execute_phase(self, title: str, path, label: str, n_hold: int) -> None:
         print(f"\n=== {title} ===")
@@ -1473,6 +1730,11 @@ class Orchestrator:
         action_label: str,
         timeout: float = 5.0,
     ) -> bool:
+        """Call an Empty gripper service (open/close), keeping the MPC
+        controller fed with hold references both while waiting for the
+        service to become available and while the call itself is pending —
+        gripper actuation happens mid-sequence in execute(), so the arm
+        trajectory reference must not go stale during either wait."""
         with self._borrow_ros_node(f"hpp_gripper_client_{time.monotonic_ns()}") as node:
             client = node.create_client(Empty, service_name)
 
@@ -1500,17 +1762,69 @@ class Orchestrator:
             print(f"Left gripper {action_label} via '{service_name}'.")
             return True
 
+    def _wait_for_gripper_settled(
+        self, action_label: str, timeout: float = GRIPPER_CONFIRM_TIMEOUT
+    ) -> bool:
+        """Poll /joint_states until the left gripper's primary joint stops
+        moving (no target position — grasp stalls against the object, not
+        0), or `timeout` elapses. Confirms physical completion independently
+        of the grasper service's own (weaker, for 'open') internal wait."""
+        last_position = [None]
+        stable_since = [None]
+
+        def _cb(msg):
+            value = self._lookup_namespaced_value(
+                dict(zip(msg.name, msg.position)), LEFT_GRIPPER_POSITION_JOINT
+            )
+            if value is None:
+                return
+            now = time.monotonic()
+            if (
+                last_position[0] is None
+                or abs(value - last_position[0]) > GRIPPER_STABLE_POSITION_TOLERANCE
+            ):
+                stable_since[0] = now
+            last_position[0] = value
+
+        with self._borrow_ros_node(f"hpp_gripper_settle_{time.monotonic_ns()}") as node:
+            subs = [
+                node.create_subscription(JointState, "/joint_states", _cb, profile)
+                for profile in JOINT_STATE_QOS_PROFILES
+            ]
+            try:
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    self._publish_hold_reference(node)
+                    rclpy.spin_once(node, timeout_sec=0.1)
+                    if (
+                        stable_since[0] is not None
+                        and time.monotonic() - stable_since[0] >= GRIPPER_STABLE_DURATION
+                    ):
+                        return True
+            finally:
+                for sub in subs:
+                    node.destroy_subscription(sub)
+
+        print(
+            f"WARNING: gripper {action_label} motion not confirmed settled via "
+            f"/joint_states within {timeout}s."
+        )
+        return False
+
     def open_gripper(
         self,
         position: float = GRIPPER_OPEN_POSITION,
         duration: float = GRIPPER_MOTION_DURATION,
         timeout: float = 5.0,
     ) -> bool:
-        """Open the left gripper in Gazebo."""
+        """Open the left gripper in Gazebo and wait until it stops moving."""
         del position, duration
-        return self._call_grasper_service(
+        if not self._call_grasper_service(
             LEFT_GRIPPER_RELEASE_SERVICE, "open", timeout=timeout
-        )
+        ):
+            return False
+        self._wait_for_gripper_settled("open")
+        return True
 
     def close_gripper(
         self,
@@ -1518,16 +1832,22 @@ class Orchestrator:
         duration: float = GRIPPER_MOTION_DURATION,
         timeout: float = 5.0,
     ) -> bool:
-        """Close the left gripper in Gazebo."""
+        """Close the left gripper in Gazebo and wait until it stops moving."""
         del position, duration
-        return self._call_grasper_service(
+        if not self._call_grasper_service(
             LEFT_GRIPPER_GRASP_SERVICE, "close", timeout=timeout
-        )
+        ):
+            return False
+        self._wait_for_gripper_settled("close")
+        return True
 
     # ── Object pose update ────────────────────────────────────────────────────
 
     @staticmethod
     def _rotation_from_xyzw(q) -> np.ndarray:
+        """q is [x, y, z, w] — the quaternion component order used by ROS
+        messages (geometry_msgs/Quaternion) and by this module's own pose
+        tuples, as opposed to Pinocchio/Eigen's [w, x, y, z]."""
         x, y, z, w = np.asarray(q, dtype=float)
         norm = np.linalg.norm([x, y, z, w])
         if norm == 0.0:
@@ -1633,9 +1953,9 @@ class Orchestrator:
         t = np.array(t)
         q = np.array(q) if q is not None else np.array([0., 0., 0., 1.])
         self._set_obj_bounds(t[0], t[1], t[2])
-        oi = self._obj_idx
-        self.q_init[oi:oi+3] = t
-        self.q_init[oi+3:oi+7] = q
+        obj_idx = self._obj_idx
+        self.q_init[obj_idx:obj_idx+3] = t
+        self.q_init[obj_idx+3:obj_idx+7] = q
         if hasattr(self, "_viewer"):
             self._viewer(self.q_init)
         print(f"Object pose updated: t={np.round(t, 4).tolist()}, q={np.round(q, 4).tolist()}")
@@ -1650,11 +1970,11 @@ class Orchestrator:
         unchanged if there's no table collision, or if it can't be cleared
         within TABLE_COLLISION_MAX_LIFT (a warning is printed in that case)."""
         q_candidate = np.array(self.q_init, copy=True)
-        oi = self._obj_idx
+        obj_idx = self._obj_idx
 
         def set_z(z):
-            q_candidate[oi:oi + 3] = [t[0], t[1], z]
-            q_candidate[oi + 3:oi + 7] = q
+            q_candidate[obj_idx:obj_idx + 3] = [t[0], t[1], z]
+            q_candidate[obj_idx + 3:obj_idx + 7] = q
 
         set_z(t[2])
         ok, report = self.problem.isConfigValid(q_candidate)
@@ -1665,6 +1985,10 @@ class Orchestrator:
                   "table collision; leaving pose as detected.")
             return t
 
+        # Stepping z upward and re-checking collision is simpler and more
+        # robust than solving for the exact clearance height directly: the
+        # collision checker doesn't expose a penetration depth, only a
+        # boolean valid/invalid per config.
         z = t[2]
         n_steps = int(TABLE_COLLISION_MAX_LIFT / TABLE_COLLISION_STEP)
         for _ in range(n_steps):
@@ -1710,6 +2034,30 @@ class Orchestrator:
         _, obj_name, best = max(candidates, key=lambda c: c[0])
         return obj_name, best.results[0].pose.pose, best.header.frame_id
 
+    def _reload_object_model(self, detected_name: str) -> None:
+        """Switch the loaded object to `detected_name` and rebuild the HPP
+        model/graph around it — called from update_object_pose_from_happypose
+        when vision detects a different object than the one currently
+        loaded. Any in-progress plan is invalidated by this since it
+        references the old model."""
+        print(
+            f"  Object changed: '{self._obj_name}' -> '{detected_name}'. "
+            "Reloading HPP model …"
+        )
+        self._obj_name = detected_name
+        self._setup_model()
+        self._setup_graph()
+        # Stale Path/config objects reference the old problem/graph —
+        # drop them so execute()/compare_pose() can't use them by accident.
+        self.p1 = self.p2 = self.p3 = self.p4 = None
+        self.qpg = self.qg = self.q_drop = None
+        if hasattr(self, "_viewer"):
+            # init_viewer() rebuilds the Viewer against the new
+            # self.robot/problem/graph and reloads its mesh geometry —
+            # just re-pushing q_init to the old Viewer only moves the
+            # previous object's already-loaded mesh, it never swaps it.
+            self.init_viewer(open=False)
+
     def update_object_pose_from_happypose(
         self,
         happypose_pose=None,
@@ -1752,23 +2100,7 @@ class Orchestrator:
             camera_frame = camera_frame or detected_frame
 
             if detected_name != self._obj_name:
-                print(
-                    f"  Object changed: '{self._obj_name}' -> '{detected_name}'. "
-                    "Reloading HPP model …"
-                )
-                self._obj_name = detected_name
-                self._setup_model()
-                self._setup_graph()
-                # Stale Path/config objects reference the old problem/graph —
-                # drop them so execute()/compare_pose() can't use them by accident.
-                self.p1 = self.p2 = self.p3 = self.p4 = None
-                self.qpg = self.qg = self.q_drop = None
-                if hasattr(self, "_viewer"):
-                    # init_viewer() rebuilds the Viewer against the new
-                    # self.robot/problem/graph and reloads its mesh geometry —
-                    # just re-pushing q_init to the old Viewer only moves the
-                    # previous object's already-loaded mesh, it never swaps it.
-                    self.init_viewer(open=False)
+                self._reload_object_model(detected_name)
 
         camera_T_object = self._pose_to_se3(happypose_pose)
 
@@ -1822,7 +2154,7 @@ class Orchestrator:
             return
 
         q_actual = self._configuration_from_joint_state(js_map, q_seed=self.q_init)
-        ai = self._active_arm_idx
+        arm_idx = self._active_arm_idx
 
         data_ref = self.model.createData()
         data_act = self.model.createData()
@@ -1845,9 +2177,12 @@ class Orchestrator:
         print(f"  EE actual  [m] : {np.round(T_act.translation, 4)}")
         print(f"  Position error : {pos_err_mm:.1f} mm")
         print(f"  Rotation error : {rot_err_deg:.2f} °")
+        # Per-joint error = reference config minus the live robot state, for
+        # each of the 7 active-arm joints — helps pinpoint which joint is
+        # off when the aggregate EE error above looks large.
         print(f"\n  Per-joint error — {self._active_arm_side} arm [rad / °]:")
         for i in range(7):
-            e = q_ref[ai + i] - q_actual[ai + i]
+            e = q_ref[arm_idx + i] - q_actual[arm_idx + i]
             print(
                 f"    arm_{self._active_arm_side}_{i+1}_joint : "
                 f"{e:+.4f} rad  ({np.degrees(e):+.2f}°)"
@@ -1858,6 +2193,7 @@ class Orchestrator:
 
     def init_viewer(self, open: bool = True):
         from pyhpp_viser import Viewer
+        _patch_viser_tab_group_remove_bug()
         self._viewer = Viewer(self.robot)
         self._viewer.initViewer(open=open, loadModel=True)
         self._viewer.setProblem(self.problem)

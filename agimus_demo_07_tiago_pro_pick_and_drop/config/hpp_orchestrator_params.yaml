@@ -48,7 +48,7 @@ drop:
 
 # ── MPC weights ───────────────────────────────────────────────────────────────
 weights:
-  w_q:           [0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12]         # keep the arm closer to the planned IK posture so it does not hunt in redundant joint space
+  w_q:           [0.60, 0.60, 0.60, 0.60, 0.60, 0.60, 0.60]         # keep the arm closer to the planned IK posture so it does not hunt in redundant joint space
   w_qdot:        [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]         # increase velocity damping so contact and final settling are less oscillatory
   w_qddot:       [0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08]         # penalize sharp acceleration reversals that show up as vibration
   w_effort:      [0.006, 0.006, 0.006, 0.006, 0.006, 0.006, 0.006]  # limit corrective torque spikes while keeping the end-effector target precise

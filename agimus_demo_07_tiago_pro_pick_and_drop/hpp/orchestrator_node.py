@@ -11,13 +11,17 @@ Drops into an IPython shell with the orchestrator pre-loaded:
     o.plan_and_execute()  # both
 """
 
-from orchestrator import Orchestrator
 import rclpy
 import sys
 import os
 
+# Defensive fallback: Python normally puts the running script's own directory
+# on sys.path automatically, which is what lets the bare `import orchestrator`
+# below succeed. Adding it explicitly here covers run contexts (e.g. some
+# `ros2 run` wrappers) where that auto-add doesn't happen.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from orchestrator import Orchestrator
 
 rclpy.init()
 
@@ -56,6 +60,8 @@ banner = (
     "  ⚠  Open the physical gripper after p3 (or p2 if p3 is None).\n"
 )
 
+# Prefer IPython for a nicer interactive shell (tab-completion, history);
+# fall back to the stdlib `code` module if it isn't installed.
 try:
     import IPython
     IPython.embed(banner1=banner, user_ns={"o": o, "rclpy": rclpy})
@@ -63,6 +69,8 @@ except ImportError:
     import code
     code.interact(banner=banner, local={"o": o, "rclpy": rclpy})
 
+# o._ros_node is only created lazily (by plan()/execute()/etc.), so it may
+# still be None here if the user never triggered ROS communication.
 if o._ros_node is not None:
     o._ros_node.destroy_node()
 rclpy.shutdown()
