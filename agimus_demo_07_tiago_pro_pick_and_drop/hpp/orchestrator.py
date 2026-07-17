@@ -287,6 +287,7 @@ class Orchestrator:
         self._obj_name = _DEFAULT_OBJ_NAME
         self._latest_joint_state_map = {}
         self._joint_state_subs = []
+        self._seed_candidates = []
 
         print("Loading HPP model …")
         self._setup_model()
@@ -967,12 +968,13 @@ class Orchestrator:
         q_start,
         q_target,
         label: str,
+        reset_roadmap: bool = True,
     ):
         planner.setTransition(transition)
         q_goal[0, :] = q_target
         print(f"Planning {label} …")
         plan_start = time.perf_counter()
-        path = planner.planPath(q_start, q_goal, True)
+        path = planner.planPath(q_start, q_goal, reset_roadmap)
         short_label = label.split()[0]
         print(
             f"  {short_label} found in {time.perf_counter() - plan_start:.2f} s "
@@ -1023,36 +1025,53 @@ class Orchestrator:
 
         return True, qpg, qg, err, qg_err
 
-    def _find_approach_path(self, planner, q_goal, max_attempts: int):
+    def _find_approach_path(self, planner, q_goal, max_attempts: int, seed_candidates=None):
         """Sample pre-grasp/grasp config pairs until one both exists
         collision-free (_sample_grasp_candidate) AND is actually reachable by
         a planned path from q_init — a candidate can be valid in isolation
         but still unreachable within the planner's iteration budget, so on
-        that specific failure we keep sampling instead of giving up."""
+        that specific failure we keep sampling instead of giving up.
+
+        `seed_candidates` (already-validated (qpg, qg, err, qg_err) tuples
+        from _select_best_handle's handle-scoring pass, for the winning
+        handle) are tried first — they cost nothing extra to obtain and let
+        us skip straight to path planning instead of resampling from scratch.
+        The roadmap is only reset before the first candidate that actually
+        reaches planPath; later retries against the same transition/start
+        reuse the tree grown from q_init instead of re-exploring from
+        scratch."""
         shooter = self.problem.configurationShooter()
         approach_validator = self._transition_approach.pathValidation()
         grasp_validator = self._transition_grasp.pathValidation()
         valid_candidate_count = 0
         search_start = time.perf_counter()
+        seed_candidates = list(seed_candidates or [])
 
-        for attempt in range(max_attempts):
-            ok, qpg, qg, err, qg_err = self._sample_grasp_candidate(
-                self._transition_approach, self._transition_grasp,
-                shooter, approach_validator, grasp_validator,
-            )
+        def candidates():
+            for qpg, qg, err, qg_err in seed_candidates:
+                yield True, qpg, qg, err, qg_err
+            for _ in range(max_attempts):
+                yield self._sample_grasp_candidate(
+                    self._transition_approach, self._transition_grasp,
+                    shooter, approach_validator, grasp_validator,
+                )
+
+        for attempt, (ok, qpg, qg, err, qg_err) in enumerate(candidates()):
             if not ok:
                 continue
 
             valid_candidate_count += 1
+            source = "seed" if attempt < len(seed_candidates) else "fresh"
             print(
-                f"  qpg candidate found at attempt {attempt + 1}, err={err:.2e}, "
+                f"  qpg candidate ({source}) at attempt {attempt + 1}, err={err:.2e}, "
                 f"search={time.perf_counter() - search_start:.2f} s"
             )
 
             try:
                 p1 = self._plan_transition_path(
                     planner, q_goal, self._transition_approach,
-                    self.q_init, qpg, "p1 (approach)"
+                    self.q_init, qpg, "p1 (approach)",
+                    reset_roadmap=(valid_candidate_count == 1),
                 )
             except RuntimeError as exc:
                 # Only swallow the "gave up searching" case; any other
@@ -1071,7 +1090,8 @@ class Orchestrator:
         if valid_candidate_count == 0:
             print(
                 "Failed to find collision-free qpg/qg pair in "
-                f"{max_attempts} attempts ({elapsed:.2f} s)."
+                f"{len(seed_candidates) + max_attempts} attempts "
+                f"({len(seed_candidates)} seed + {max_attempts} fresh) ({elapsed:.2f} s)."
             )
         else:
             print(
@@ -1141,21 +1161,27 @@ class Orchestrator:
         self._transition_* to whichever handle is actually reachable —
         vision can't tell us which one is (e.g. the object may be detected
         flipped ~180 deg), so this decides based on observed success rate
-        instead of assuming a single canonical orientation."""
+        instead of assuming a single canonical orientation.
+
+        The winning handle's successful samples are kept (self._seed_candidates)
+        so _find_approach_path can try them directly instead of resampling
+        from scratch for the handle we already know is reachable."""
         shooter = self.problem.configurationShooter()
         scores = []
         for cand in self._grasp_candidates:
             approach_validator = cand["approach"].pathValidation()
             grasp_validator = cand["grasp"].pathValidation()
-            successes = sum(
+            samples = [
                 self._sample_grasp_candidate(
                     cand["approach"], cand["grasp"],
                     shooter, approach_validator, grasp_validator,
-                )[0]
+                )
                 for _ in range(trial_attempts)
-            )
-            scores.append(successes)
-            print(f"  Handle '{cand['name']}': {successes}/{trial_attempts} reachable samples.")
+            ]
+            valid = [(qpg, qg, err, qg_err) for ok, qpg, qg, err, qg_err in samples if ok]
+            cand["_valid_samples"] = valid
+            scores.append(len(valid))
+            print(f"  Handle '{cand['name']}': {len(valid)}/{trial_attempts} reachable samples.")
 
         chosen = self._grasp_candidates[scores.index(max(scores))]
         print(f"  Selected handle: '{chosen['name']}'.")
@@ -1163,6 +1189,7 @@ class Orchestrator:
         self._transition_grasp    = chosen["grasp"]
         self._transition_carry    = chosen["carry"]
         self._transition_release  = chosen["release"]
+        self._seed_candidates     = chosen["_valid_samples"]
 
     def plan(
         self,
@@ -1203,7 +1230,7 @@ class Orchestrator:
         q_goal = np.zeros((1, self.robot.configSize()), order='F')
 
         p1, qpg, qg, qg_err = self._find_approach_path(
-            planner, q_goal, max_attempts
+            planner, q_goal, max_attempts, seed_candidates=self._seed_candidates
         )
         if p1 is None:
             return False
