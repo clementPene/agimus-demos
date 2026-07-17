@@ -181,8 +181,6 @@ W_FRAME_TRANS = np.array(_w["w_frame_trans"])
 W_FRAME_ROT   = np.array(_w["w_frame_rot"])
 
 GRIPPER_OPEN_POSITION = 0.07     # m, fingertip travel used as the HPP planning target
-GRIPPER_CLOSED_POSITION = 0.0
-GRIPPER_MOTION_DURATION = 1.5     # s, unused delay kept for API compatibility (see open/close_gripper)
 HPP_FIXED_JOINT_EPS = 1e-6        # +/- bound width used to "freeze" a joint for HPP planning
 TABLE_COLLISION_MAX_LIFT = 0.10   # max upward correction (m) before giving up
 TABLE_COLLISION_STEP     = 0.005  # z increment per collision-check iteration (m)
@@ -1373,10 +1371,6 @@ class Orchestrator:
 
     @staticmethod
     def _ensure_mpc_publisher(node: Node):
-        pub = getattr(node, "_pub", None)
-        if pub is not None:
-            return pub
-
         pub = getattr(node, "_hpp_mpc_input_pub", None)
         if pub is None:
             qos = QoSProfile(depth=1000, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -1455,11 +1449,7 @@ class Orchestrator:
                 node.destroy_subscription(sub)
         return None
 
-    def _joint_state_map(self, node_name: str, timeout: float):
-        """`node_name` is unused (kept for call-site compatibility) — reads
-        from the persistent /joint_states cache shared by the execution node
-        instead of spinning up a throwaway subscription per call."""
-        del node_name
+    def _joint_state_map(self, timeout: float):
         node = self._execution_node()
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -1562,7 +1552,7 @@ class Orchestrator:
         if not named_paths:
             return
 
-        js_map = self._joint_state_map("hpp_execute_alignment_check", timeout)
+        js_map = self._joint_state_map(timeout)
         if js_map is None:
             return
 
@@ -1778,7 +1768,7 @@ class Orchestrator:
 
     def sync_from_robot(self, timeout: float = 5.0) -> bool:
         """Update q_init and locked planning joints from the current robot state."""
-        js_map = self._joint_state_map("hpp_sync_node", timeout)
+        js_map = self._joint_state_map(timeout)
         if js_map is None:
             print("sync_from_robot: timeout — could not receive /joint_states")
             return False
@@ -1845,30 +1835,18 @@ class Orchestrator:
         print(f"Left gripper {action_label} via '{service_name}'.")
         return True
 
-    def open_gripper(
-        self,
-        position: float = GRIPPER_OPEN_POSITION,
-        duration: float = GRIPPER_MOTION_DURATION,
-        timeout: float = 5.0,
-    ) -> bool:
+    def open_gripper(self, timeout: float = 5.0) -> bool:
         """Open the left gripper in Gazebo. The grasper service itself blocks
         until the physical motion completes (or its own timeout elapses), so
         its return value is the completion signal — see gripper_grasper_srv.py."""
-        del position, duration
         return self._call_grasper_service(
             LEFT_GRIPPER_RELEASE_SERVICE, "open", timeout=timeout
         )
 
-    def close_gripper(
-        self,
-        position: float = GRIPPER_CLOSED_POSITION,
-        duration: float = GRIPPER_MOTION_DURATION,
-        timeout: float = 5.0,
-    ) -> bool:
+    def close_gripper(self, timeout: float = 5.0) -> bool:
         """Close the left gripper in Gazebo. The grasper service itself blocks
         until the physical motion completes (or its own timeout elapses), so
         its return value is the completion signal — see gripper_grasper_srv.py."""
-        del position, duration
         return self._call_grasper_service(
             LEFT_GRIPPER_GRASP_SERVICE, "close", timeout=timeout
         )
@@ -2180,7 +2158,7 @@ class Orchestrator:
 
         q_ref = self._as_full_configuration(q_ref)
 
-        js_map = self._joint_state_map("hpp_compare_pose", timeout)
+        js_map = self._joint_state_map(timeout)
         if js_map is None:
             print("compare_pose: timeout reading /joint_states")
             return
