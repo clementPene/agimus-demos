@@ -54,6 +54,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from agimus_msgs.msg import MpcInput, MpcEEInput
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool
 from std_srvs.srv import Empty
 from vision_msgs.msg import Detection2DArray
 
@@ -288,6 +289,10 @@ class Orchestrator:
         self._latest_joint_state_map = {}
         self._joint_state_subs = []
         self._seed_candidates = []
+        # Grasping isn't reliable in simulation — set this to False to skip
+        # _check_object_grasped()'s abort when the topic is technically
+        # published but always reports no grasp (e.g. Gazebo testing).
+        self.enforce_grasp_check = True
 
         print("Loading HPP model …")
         self._setup_model()
@@ -1504,8 +1509,12 @@ class Orchestrator:
         """Spin `node` until `future` resolves, publishing a hold reference
         at DT intervals in the meantime — used while waiting on ROS service
         calls (e.g. gripper open/close) so the controller doesn't go quiet
-        mid-sequence."""
+        mid-sequence. Gripper close/open calls can legitimately block for a
+        few seconds (contact-detection window server-side), so print
+        progress periodically rather than going silent the whole time."""
         next_hold_time = time.monotonic()
+        start = time.monotonic()
+        next_progress = start + 1.0
         while not future.done():
             if self._last_hold_msg is not None:
                 now = time.monotonic()
@@ -1517,6 +1526,10 @@ class Orchestrator:
             else:
                 timeout_sec = 0.1
             rclpy.spin_once(node, timeout_sec=timeout_sec)
+            now = time.monotonic()
+            if now >= next_progress:
+                print(f"  ... waiting for gripper service response (elapsed {now - start:.1f}s)")
+                next_progress = now + 1.0
 
     def _build_messages(self, paths: list, n_hold: int = 200) -> list:
         """Sample each (path, label) pair into MpcInput messages, then
@@ -1740,6 +1753,8 @@ class Orchestrator:
         print("\n=== Closing gripper ===")
         if not self.close_gripper():
             return abort("gripper close")
+        if not self._check_object_grasped():
+            return abort("grasp verification — object not detected in gripper, refusing to carry")
 
         if self.p3 is not None:
             if not self._execute_phase("Phase 3: Carry to drop zone", self.p3, "p3 (carry)", 50):
@@ -1877,6 +1892,38 @@ class Orchestrator:
         return self._call_grasper_service(
             LEFT_GRIPPER_GRASP_SERVICE, "close", timeout=timeout
         )
+
+    def _check_object_grasped(self, timeout: float = 2.0) -> bool:
+        """If /gripper_left_grasper_srv/is_grasped has an active publisher,
+        read it to confirm close_gripper() actually made contact with the
+        object — gripper_grasper_srv.py's grasp_cb reports success
+        unconditionally on its own timeout even with no contact detected, so
+        the service call succeeding doesn't by itself mean anything was
+        grasped. Where nothing publishes this topic, the signal isn't
+        available in the current environment, so skip the check rather than
+        block on it. Set self.enforce_grasp_check = False to bypass entirely
+        (e.g. in simulation, where grasping/contact isn't reliable so the
+        topic can be published but always report no grasp)."""
+        if not self.enforce_grasp_check:
+            print("  enforce_grasp_check is False — skipping grasp verification.")
+            return True
+
+        topic = "/gripper_left_grasper_srv/is_grasped"
+        node = self._execution_node()
+        deadline = time.time() + 1.0
+        while time.time() < deadline and node.count_publishers(topic) == 0:
+            rclpy.spin_once(node, timeout_sec=0.1)
+        if node.count_publishers(topic) == 0:
+            print(f"  {topic} has no publisher — skipping grasp verification.")
+            return True
+
+        msg = self._wait_for_topic_message(node, Bool, topic, timeout)
+        if msg is None:
+            print(f"WARNING: no response from {topic} within {timeout}s.")
+            return False
+        if not msg.data:
+            print("WARNING: gripper did not detect a grasped object.")
+        return msg.data
 
     # ── Object pose update ────────────────────────────────────────────────────
 

@@ -8,7 +8,7 @@
 trajectory:
   dt: 0.01          # sampling period (s) — must match agimus_controller rate
   time_scale: 1.6   # stretch HPP path time further so the arm settles with less overshoot while keeping the same final pose
-  carry_time_scale: 1.0   # keep the long transport phase closer to nominal timing so p3 does not drag in Gazebo
+  carry_time_scale: 1.3   # faster than time_scale so p3 does not drag in Gazebo, but not as fast as 1.0 — gives the controller more margin to track the carry motion (1.0 was seen to intermittently lose tracking)
 
 # ── Configurable T-LESS object ───────────────────────────────────────────────
 # Shipped object assets: obj_01, obj_20, obj_21, obj_22, obj_23, obj_23,

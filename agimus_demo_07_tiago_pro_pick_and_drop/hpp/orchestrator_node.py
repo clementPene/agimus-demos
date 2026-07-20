@@ -35,6 +35,7 @@ banner = (
     "║  o.sync_from_robot()         — sync q_init from robot state    ║\n"
     "║  o.open_gripper()            — open the left gripper in Gazebo ║\n"
     "║  o.close_gripper()           — close the left gripper in Gazebo║\n"
+    "║  o.enforce_grasp_check = False — skip grasp verify (sim)       ║\n"
     "║  o.update_object_pose(t, q)  — update obj position in q_init   ║\n"
     "║  o.update_object_pose_from_happypose() — move obj from vision  ║\n"
     "║  o.activate_lfc()            — switch to torque control        ║\n"
