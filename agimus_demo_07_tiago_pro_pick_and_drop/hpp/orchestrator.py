@@ -1634,7 +1634,13 @@ class Orchestrator:
         reference was sent, not that the (torque-controlled) arm has
         physically caught up to it — this confirms it did before the caller
         moves on to the next phase (e.g. a gripper action). Checked via EE
-        pose rather than per-joint error — see the ARM_SETTLE_EE_* comment."""
+        pose rather than per-joint error — see the ARM_SETTLE_EE_* comment.
+
+        Hold references are re-published at DT-spaced wall-clock intervals
+        (mirroring _spin_future_with_hold), rather than once per spin_once
+        iteration — spin_once's cadence here depends on /joint_states
+        arrival plus this loop's own FK work, which can run slower than the
+        controller's consumption rate and starve the MPC input buffer."""
         if self._last_executed_q is None:
             return True
         q_target = np.asarray(self._last_executed_q)
@@ -1648,9 +1654,18 @@ class Orchestrator:
         start = time.monotonic()
         deadline = start + timeout
         next_progress = start + 1.0
+        next_hold_time = start
         while time.monotonic() < deadline:
-            self._publish_hold_reference(node)
-            rclpy.spin_once(node, timeout_sec=0.1)
+            if self._last_hold_msg is not None:
+                now = time.monotonic()
+                if now >= next_hold_time:
+                    self._publish_hold_reference(node)
+                    next_hold_time = now + DT
+                    continue
+                timeout_sec = max(0.0, min(0.1, next_hold_time - now))
+            else:
+                timeout_sec = 0.1
+            rclpy.spin_once(node, timeout_sec=timeout_sec)
             if self._latest_joint_state_map:
                 q_actual = self._configuration_from_joint_state(
                     self._latest_joint_state_map, q_seed=self.q_init
