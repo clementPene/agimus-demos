@@ -20,6 +20,7 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
 
 
@@ -29,8 +30,10 @@ class OneShotCapture(Node):
         super().__init__('megapose_capture')
         self.image_msg = None
         self.info_msg = None
-        self.create_subscription(Image, image_topic, self._image_cb, 1)
-        self.create_subscription(CameraInfo, info_topic, self._info_cb, 1)
+        self.create_subscription(
+            Image, image_topic, self._image_cb, qos_profile_sensor_data)
+        self.create_subscription(
+            CameraInfo, info_topic, self._info_cb, qos_profile_sensor_data)
 
     def _image_cb(self, msg):
         self.image_msg = msg

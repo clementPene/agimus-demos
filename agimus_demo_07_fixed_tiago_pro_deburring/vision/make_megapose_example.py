@@ -8,12 +8,12 @@ Layout produced (happypose run_inference_on_example format):
     $HAPPYPOSE_DATA_DIR/examples/<label>/
         image_rgb.png
         camera_data.json
-        inputs/object_data.json
-        meshes/<label>/<label>.ply
+        object_data.json
+        meshes/<label>.ply
 
 Then run on the GPU machine:
     python -m happypose.pose_estimators.megapose.scripts.run_inference_on_example \
-        <label> --run-inference --vis-outputs
+        <label> --run-inference --vis-poses
 
 Usage:
     python3 make_megapose_example.py --capture ./capture_01 --mesh ./pylone.ply
@@ -70,8 +70,8 @@ def main():
     print(f'bbox_modal: {bbox}')
 
     example_dir = os.path.join(args.data_dir, 'examples', args.label)
-    os.makedirs(os.path.join(example_dir, 'inputs'), exist_ok=True)
-    mesh_dir = os.path.join(example_dir, 'meshes', args.label)
+    os.makedirs(example_dir, exist_ok=True)
+    mesh_dir = os.path.join(example_dir, 'meshes')
     os.makedirs(mesh_dir, exist_ok=True)
 
     shutil.copy(image_path, os.path.join(example_dir, 'image_rgb.png'))
@@ -80,15 +80,14 @@ def main():
                 os.path.join(mesh_dir, args.label + '.ply'))
 
     object_data = [{'label': args.label, 'bbox_modal': bbox}]
-    with open(os.path.join(example_dir, 'inputs', 'object_data.json'),
-              'w') as f:
+    with open(os.path.join(example_dir, 'object_data.json'), 'w') as f:
         json.dump(object_data, f, indent=2)
 
     print(f'Example ready in {example_dir}')
     print('Run inference with:')
     print('  python -m happypose.pose_estimators.megapose.scripts.'
           f'run_inference_on_example {args.label} '
-          '--run-inference --vis-outputs')
+          '--run-inference --vis-poses')
 
 
 if __name__ == '__main__':
