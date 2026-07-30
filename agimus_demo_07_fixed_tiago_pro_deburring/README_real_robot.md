@@ -97,6 +97,44 @@ Once the mocap is connected (see [section 5.5](#55-mocap-qualisys-optional)), ru
 o.localize_pylone_from_mocap()   # reads pylone pose from mocap, saves to pylone_pose.yaml
 ```
 
+### Option C — Vision (MegaPose)
+
+Requires a `vision_cuda` devcontainer (GPU) in addition to `control`. Both
+run with `--network host`, so they see each other's ROS2 topics/services
+without any extra setup.
+
+**One-time calibration** (redo if the camera or the pylone's approximate
+position changed since the last calibration) — in `vision_cuda`, with the
+bringup already running so the camera topics are live:
+
+```bash
+cd ~/ros2_ws/src/agimus-demos/agimus_demo_07_fixed_tiago_pro_deburring/vision
+python3 capture_image.py --output ./captures/capture_NN
+python3 make_megapose_example.py --capture ./captures/capture_NN --mesh ./pylone.ply
+```
+
+See `vision/README.md` for the full capture → mesh → bbox procedure.
+
+**Launch the estimator node** (`vision_cuda`, one terminal, kept running):
+
+```bash
+python3 pylone_pose_estimator_node.py
+```
+
+**From the IPython shell** (`control`):
+
+```python
+o.connect_vision()
+o.compare_vision()               # ~20-30s: prints delta vs current q_init pylone pose
+o.localize_pylone_from_vision()  # commits the estimate to q_init + pylone_pose_vision.yaml
+```
+
+`compare_vision()` compares against whatever is currently in `q_init` — run
+`o.reload_pylone_pose()` or `o.localize_pylone_from_mocap()` first to compare
+against a trusted reference. MegaPose is not a detector: the calibrated bbox
+is reused as-is on every call, not re-detected — see the "Limite connue" note
+in `vision/README.md`.
+
 ---
 
 ## 4. Launch the demo

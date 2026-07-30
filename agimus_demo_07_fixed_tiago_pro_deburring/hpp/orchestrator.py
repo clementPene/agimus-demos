@@ -41,6 +41,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from agimus_msgs.msg import MpcInput, MpcEEInput
 from control_msgs.msg import DynamicJointState
 from sensor_msgs.msg import JointState
+from geometry_msgs.msg import PoseStamped
+from std_srvs.srv import Trigger
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -61,6 +63,7 @@ DT         = _cfg["trajectory"]["dt"]
 TIME_SCALE = _cfg["trajectory"]["time_scale"]
 
 _PYLONE_POSE_FILE = os.path.join(_PKG_DIR, "config", "pylone_pose.yaml")
+_PYLONE_POSE_VISION_FILE = os.path.join(_PKG_DIR, "config", "pylone_pose_vision.yaml")
 
 HANDLE_NAME = _cfg["handle"]["name"]
 
@@ -1026,6 +1029,156 @@ class Orchestrator:
         with open(_PYLONE_POSE_FILE, "w") as _f:
             yaml.dump(result, _f, default_flow_style=False)
         print(f"Pylone pose saved to {_PYLONE_POSE_FILE}")
+
+    # ── Vision (MegaPose) ────────────────────────────────────────────────────
+
+    def connect_vision(self) -> None:
+        """Create the ROS2 client for the /vision_pylone/estimate service.
+
+        Call this once before compare_vision() or localize_pylone_from_vision().
+        Requires vision/pylone_pose_estimator_node.py running in the
+        vision_cuda container (see vision/README.md) — reachable here over
+        plain ROS2/DDS since both devcontainers run with --network host.
+        """
+        if self._ros_node is None:
+            self._ros_node = rclpy.create_node("hpp_orchestrator_vision")
+        self._vision_cli = self._ros_node.create_client(Trigger, "/vision_pylone/estimate")
+        if not self._vision_cli.wait_for_service(timeout_sec=5.0):
+            print("Vision service /vision_pylone/estimate not available — "
+                  "is pylone_pose_estimator_node.py running in vision_cuda?")
+            return
+        print("Vision service connected.")
+
+    def _vision_se3(self, timeout: float = 60.0) -> pin.SE3:
+        """Trigger a MegaPose estimate and return the pylone pose as SE3.
+
+        Blocks on the /vision_pylone/estimate service call (inference takes
+        ~20-30s), then reads the resulting pose off /vision_pylone/pose.
+        The pose is already expressed in base_link frame (composed
+        server-side with the base_link -> camera TF at capture time).
+        """
+        if not hasattr(self, "_vision_cli"):
+            raise RuntimeError("No vision client — call connect_vision() first.")
+
+        _own_node = False
+        if self._ros_node is None:
+            self._ros_node = rclpy.create_node("hpp_orchestrator_vision")
+            _own_node = True
+
+        future = self._vision_cli.call_async(Trigger.Request())
+        rclpy.spin_until_future_complete(self._ros_node, future, timeout_sec=timeout)
+        if not future.done() or future.result() is None:
+            raise RuntimeError("Vision estimate service call timed out.")
+        if not future.result().success:
+            raise RuntimeError(f"Vision estimate failed: {future.result().message}")
+
+        pose_msg = [None]
+        sub = self._ros_node.create_subscription(
+            PoseStamped, "/vision_pylone/pose",
+            lambda m: pose_msg.__setitem__(0, m), 10)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and pose_msg[0] is None:
+            rclpy.spin_once(self._ros_node, timeout_sec=0.1)
+        self._ros_node.destroy_subscription(sub)
+
+        if _own_node:
+            self._ros_node.destroy_node()
+            self._ros_node = None
+
+        if pose_msg[0] is None:
+            raise RuntimeError("Timeout reading /vision_pylone/pose after estimate.")
+
+        p = pose_msg[0].pose
+        xyzquat = np.array([
+            p.position.x, p.position.y, p.position.z,
+            p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w,
+        ])
+        return pin.XYZQUATToSE3(xyzquat)
+
+    def compare_vision(self) -> None:
+        """Compare a fresh MegaPose vision estimate vs the currently localized pylone pose.
+
+        Prints position error (mm) and rotation error (deg) between the
+        vision estimate and the pylone pose currently in q_init (e.g. set
+        by localize_pylone_from_mocap() or reload_pylone_pose()). Run
+        compare_mocap() alongside this to compare both methods against the
+        same reference.
+
+        Requires connect_vision().
+        """
+        print("Requesting vision estimate (this can take ~20-30s) …")
+        try:
+            T_pyl_vision = self._vision_se3()
+        except RuntimeError as e:
+            print(f"compare_vision: {e}")
+            return
+
+        pi = self._pylone_idx
+        T_pyl_current = pin.XYZQUATToSE3(
+            np.concatenate([self.q_init[pi:pi+3], self.q_init[pi+3:pi+7]])
+        )
+
+        def _breakdown(T_a: pin.SE3, T_b: pin.SE3):
+            """Return signed per-axis errors: (dt_mm[3], drpy_deg[3])."""
+            delta = T_a.inverse() * T_b
+            dt_mm = delta.translation * 1e3
+            drpy = np.degrees(pin.utils.matrixToRpy(delta.rotation))
+            return dt_mm, drpy
+
+        t_v, t_c = T_pyl_vision.translation, T_pyl_current.translation
+        rpy_v = np.degrees(pin.utils.matrixToRpy(T_pyl_vision.rotation))
+        rpy_c = np.degrees(pin.utils.matrixToRpy(T_pyl_current.rotation))
+        dt_mm, drpy = _breakdown(T_pyl_vision, T_pyl_current)
+        norm_t, norm_r = np.linalg.norm(dt_mm), np.linalg.norm(drpy)
+        flag = "✓" if norm_t < 20 and norm_r < 5 else "!"
+
+        print(f"\n{'='*66}")
+        print("  Vision (MegaPose) ↔ pose localisée courante")
+        print(f"{'='*66}")
+        print(f"  {'':4s}{'':12s}  {'x':>9s}  {'y':>9s}  {'z':>9s}")
+        print(f"  {'':4s}{'vision [m]':12s}  {t_v[0]:>+9.4f}  {t_v[1]:>+9.4f}  {t_v[2]:>+9.4f}")
+        print(f"  {'':4s}{'current [m]':12s}  {t_c[0]:>+9.4f}  {t_c[1]:>+9.4f}  {t_c[2]:>+9.4f}")
+        print(f"  {'':4s}{'Δ [mm]':12s}  {dt_mm[0]:>+9.2f}  {dt_mm[1]:>+9.2f}  {dt_mm[2]:>+9.2f}  (|Δ|={norm_t:.1f} mm)  {flag}")
+        print("")
+        print(f"  {'':4s}{'':12s}  {'roll':>9s}  {'pitch':>9s}  {'yaw':>9s}")
+        print(f"  {'':4s}{'vision [°]':12s}  {rpy_v[0]:>+9.2f}  {rpy_v[1]:>+9.2f}  {rpy_v[2]:>+9.2f}")
+        print(f"  {'':4s}{'current [°]':12s}  {rpy_c[0]:>+9.2f}  {rpy_c[1]:>+9.2f}  {rpy_c[2]:>+9.2f}")
+        print(f"  {'':4s}{'Δ [°]':12s}  {drpy[0]:>+9.2f}  {drpy[1]:>+9.2f}  {drpy[2]:>+9.2f}  (|Δ|={norm_r:.2f}°)  {flag}")
+        print(f"\n{'='*66}\n")
+
+    def localize_pylone_from_vision(self) -> None:
+        """Set the pylone pose in the orchestrator from a fresh MegaPose estimate.
+
+        Reads the vision pose of the pylone (base_link frame), updates
+        q_init and saves the result to config/pylone_pose_vision.yaml — a
+        separate file from config/pylone_pose.yaml (the mocap/manual-
+        pointing "trusted" source), so both can be compared without one
+        overwriting the other.
+
+        Requires connect_vision().
+        """
+        print("Requesting vision estimate (this can take ~20-30s) …")
+        try:
+            T_pyl_vision = self._vision_se3()
+        except RuntimeError as e:
+            print(f"localize_pylone_from_vision: {e}")
+            return
+
+        t = T_pyl_vision.translation.tolist()
+        qpin = pin.Quaternion(T_pyl_vision.rotation)
+        q = [float(qpin.x), float(qpin.y), float(qpin.z), float(qpin.w)]
+
+        self.update_pylone_pose(t, q)
+
+        result = {
+            "pylone_x":    round(t[0], 4),
+            "pylone_y":    round(t[1], 4),
+            "pylone_z":    round(t[2], 4),
+            "pylone_quat": [round(v, 6) for v in q],
+        }
+        with open(_PYLONE_POSE_VISION_FILE, "w") as _f:
+            yaml.dump(result, _f, default_flow_style=False)
+        print(f"Pylone pose (vision) saved to {_PYLONE_POSE_VISION_FILE}")
 
     # ── Controller activation ─────────────────────────────────────────────────
 

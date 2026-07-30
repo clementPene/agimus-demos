@@ -35,3 +35,5 @@ log/
 *.rqt_cache
 
 # Test-related ignores
+agimus_demo_07_fixed_tiago_pro_deburring/vision/captures/
+agimus_demo_07_fixed_tiago_pro_deburring/vision/results/
