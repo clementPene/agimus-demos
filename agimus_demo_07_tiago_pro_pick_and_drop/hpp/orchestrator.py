@@ -232,6 +232,7 @@ W_FRAME_ROT   = np.array(_w["w_frame_rot"])
 
 GRIPPER_OPEN_POSITION = 0.07     # m, fingertip travel used as the HPP planning target
 HPP_FIXED_JOINT_EPS = 1e-6        # +/- bound width used to "freeze" a joint for HPP planning
+ACTIVE_ARM_JOINT_SHRINK_RATIO = 0.95  # HPP plans within this fraction of each active-arm joint's real range
 TABLE_COLLISION_MAX_LIFT = 0.10   # max upward correction (m) before giving up
 TABLE_COLLISION_STEP     = 0.005  # z increment per collision-check iteration (m)
 # Each gripper is driven in HPP by a single open/close scalar (0=closed,
@@ -549,6 +550,45 @@ class Orchestrator:
             [value - HPP_FIXED_JOINT_EPS, value + HPP_FIXED_JOINT_EPS],
         )
 
+    def _shrink_active_arm_joint_range(self, ratio: float = ACTIVE_ARM_JOINT_SHRINK_RATIO) -> None:
+        """
+        Reduce each active-arm joint's planning range to `ratio` of its full
+        URDF range, centered on the same midpoint (mirrors
+        hpp.corbaserver.robot.shrinkJointRange — pyhpp's Device has no
+        equivalent, and no getJointBounds to read current bounds from, so
+        this is reimplemented against Pinocchio's own model limits). Updates
+        both self.robot.setJointBounds (what HPP's planner/graph actually
+        samples and enforces) and self.model.lowerPositionLimit/
+        upperPositionLimit (read directly by _find_drop_config's own IK-seed
+        bounds check) so the two stay consistent. Keeps the arm away from its
+        hard joint limits, since HPP's own pathValidation doesn't reliably
+        catch out-of-bounds solutions for this redundant 7-DOF arm.
+        """
+        arm_idx = self._active_arm_idx
+        self._active_arm_shrunk_bounds = []
+        for i, joint_name in enumerate(self._active_arm_joint_names):
+            idx_q = arm_idx + i
+            lower = float(self.model.lowerPositionLimit[idx_q])
+            upper = float(self.model.upperPositionLimit[idx_q])
+            half_width = 0.5 * ratio * (upper - lower)
+            mean = 0.5 * (upper + lower)
+            new_lower, new_upper = mean - half_width, mean + half_width
+            self.robot.setJointBounds(joint_name, [new_lower, new_upper])
+            self.model.lowerPositionLimit[idx_q] = new_lower
+            self.model.upperPositionLimit[idx_q] = new_upper
+            self._active_arm_shrunk_bounds.append((new_lower, new_upper))
+
+    def _project_into_active_arm_range(self, q: np.ndarray, tol: float = 1e-3) -> np.ndarray:
+        """Clamp the active arm's 7 joint values in `q` into their shrunk
+        planning range (mirrors pyhpp's missing projectInJointRange) —
+        needed because a live robot pose read from /joint_states can sit in
+        the outer range _shrink_active_arm_joint_range no longer considers
+        valid for planning."""
+        arm_idx = self._active_arm_idx
+        for i, (lower, upper) in enumerate(self._active_arm_shrunk_bounds):
+            q[arm_idx + i] = np.clip(q[arm_idx + i], lower + tol, upper - tol)
+        return q
+
     def _gripper_hpp_targets(self, position: float, joint_multipliers: tuple) -> dict:
         targets = {}
         for joint_name, multiplier in joint_multipliers:
@@ -635,6 +675,7 @@ class Orchestrator:
         detected object changes — see update_object_pose_from_happypose)."""
         self._load_urdf_models()
         self._resolve_joint_topology()
+        self._shrink_active_arm_joint_range()
 
         self._set_obj_bounds(*OBJ_INIT_POS)
         self._set_table_bounds()
@@ -2343,6 +2384,7 @@ class Orchestrator:
         if self._right_arm_idx is not None and right_arm is not None:
             self._other_arm_lock_values = right_arm.tolist()
         self.q_init = self._configuration_from_joint_state(js_map, q_seed=self.q_init)
+        self.q_init = self._project_into_active_arm_range(self.q_init, tol=1e-3)
         print("  Rebuilding constraint graph with synced robot state …")
         self._setup_graph()
         status = [f"torso={self._fixed_joint_values['torso_lift_joint']:.3f}"]
