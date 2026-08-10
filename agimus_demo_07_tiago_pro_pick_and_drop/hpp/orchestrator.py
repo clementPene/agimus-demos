@@ -5,7 +5,9 @@ The robot picks a configurable T-LESS object from a table at 74.5 cm height
 using the left arm (pal-pro-gripper), carries it to a configurable drop zone,
 and releases it into a box positioned above the table there (urdf/box.urdf,
 config box.{x,y,z}) — a real HPP collision obstacle for p_place/p4/p5 only;
-p1/p2/p3 explicitly ignore it (see _setup_graph's box exemption loop).
+p1/p2/p2b/p3 plan with box collision temporarily disabled instead (see
+_ignoring_box_collisions — per-transition security margins don't actually
+suppress a hard collision for config validation in this pyhpp build).
 
 Interactive usage (IPython):
     o = Orchestrator()
@@ -952,6 +954,75 @@ class Orchestrator:
         self.problem.addConfigValidation("CollisionValidation")
         self.graph   = graph
 
+    @contextmanager
+    def _ignoring_box_collisions(self):
+        """Temporarily exclude every tiago_pro<->box collision pair from
+        collision checking — used by tuck_arm(), where the box is
+        irrelevant to a recovery motion and the canonical tuck posture can
+        coincidentally overlap it depending on where the box is
+        configured.
+
+        Per-transition security margins (the float("-inf") trick used
+        above for approach/grasp/carry) do NOT actually suppress a
+        genuine hard collision for discrete configuration validation in
+        this pyhpp build — confirmed empirically: transitions already
+        "exempted" that way report the exact same collision as
+        non-exempted ones. self.problem snapshots the geometry model's
+        collision pairs when it's constructed (in _setup_graph), so
+        mutating self.robot.geomModel() afterwards has no effect on an
+        already-built self.problem; the pairs must be removed BEFORE
+        _setup_graph() rebuilds the graph, and restored (with the graph
+        rebuilt again) afterwards so p3/p4/p5/p_place keep their own real
+        box-avoidance for the rest of the session.
+
+        Rebuilding the graph like this has two side effects callers must
+        handle themselves: (1) self._transition_* reset to the FIRST
+        grasp candidate (_build_grasp_candidates' default), discarding
+        whatever _select_best_handle() picked — this method re-resolves
+        the previously-selected transitions by name (stable across
+        rebuilds) immediately after each rebuild so callers see the same
+        handle selection before and after; (2) self.problem is a brand
+        new object each rebuild, so any TransitionPlanner/RandomShortcut/
+        SplineGradientBased_bezier3 a caller already constructed against
+        the old self.problem is now stale — callers must construct fresh
+        ones AFTER entering this context (and again after it exits, for
+        anything they still need to plan outside it)."""
+        selected_names = {
+            attr: getattr(self, attr).name()
+            for attr in (
+                "_transition_approach", "_transition_grasp", "_transition_carry",
+                "_transition_place", "_transition_release", "_transition_return",
+            )
+            if getattr(self, attr, None) is not None
+        }
+
+        def _restore_selected_handle():
+            for attr, name in selected_names.items():
+                try:
+                    setattr(self, attr, self.graph.getTransition(name))
+                except Exception as e:
+                    print(f"  WARNING: could not re-resolve {attr} ('{name}') after rebuilding the graph: {e}")
+
+        geom_model = self.robot.geomModel()
+        names = [go.name for go in geom_model.geometryObjects]
+        removed = []
+        for cp in list(geom_model.collisionPairs):
+            n1, n2 = names[cp.first], names[cp.second]
+            if (n1.startswith("tiago_pro/") and n2.startswith("box/")) or \
+               (n2.startswith("tiago_pro/") and n1.startswith("box/")):
+                removed.append((cp.first, cp.second))
+        for i1, i2 in removed:
+            geom_model.removeCollisionPair(pin.CollisionPair(i1, i2))
+        self._setup_graph()
+        _restore_selected_handle()
+        try:
+            yield
+        finally:
+            for i1, i2 in removed:
+                geom_model.addCollisionPair(pin.CollisionPair(i1, i2))
+            self._setup_graph()
+            _restore_selected_handle()
+
     def _build_grasp_candidates(self, graph):
         """Build one (approach, grasp, carry, release) transition quadruple
         per object handle. Vision can't tell us which handle is actually
@@ -1132,7 +1203,7 @@ class Orchestrator:
             state_name, _ = graph.getNodesConnectedByTransition(carry_transition)
             state = graph.getState(state_name)
             edge = graph.createTransition(
-                state, state, f"{carry_transition.name} place", 0, state
+                state, state, f"{carry_transition.name()} place", 0, state
             )
             ncs = graph.getNumericalConstraintsForEdge(carry_transition)
             graph.addNumericalConstraintsToTransition(edge, ncs)
@@ -1224,9 +1295,14 @@ class Orchestrator:
             transition, q_from, q_seed
         )
         if not generated:
+            self._last_invalid_config_report = None
             return False, False, None, err
         validator = validator or transition.pathValidation()
-        valid, _ = validator.validateConfiguration(q_candidate)
+        valid, report = validator.validateConfiguration(q_candidate)
+        # Stashed for callers that want to explain a failure to the user
+        # (e.g. tuck_arm()) without changing this method's return
+        # signature, which every other caller already unpacks as a 4-tuple.
+        self._last_invalid_config_report = None if valid else report
         return True, valid, (q_candidate if valid else None), err
 
     def _sample_grasp_candidate(
@@ -1328,16 +1404,7 @@ class Orchestrator:
             )
         return None, None, None, None
 
-    def _plan_carry_place_release(
-        self,
-        planner,
-        q_goal,
-        qg,
-        qpg,
-        fallback_p4,
-        shortcut,
-        spline_opt,
-    ):
+    def _plan_carry_place_release(self, qg, qpg, fallback_p4):
         """Plan p2b (retract to handle clearance), p3 (carry to transport
         pose), p_place (transport pose to drop zone — executed after
         navigation), p4 (release/retreat) and p5 (return to carry pose,
@@ -1346,7 +1413,14 @@ class Orchestrator:
         than aborting the whole plan: no carry edge, no reachable
         carry/drop config, or a planning exception all fall back to
         `fallback_p4` (the reversed p2 computed by the caller), leaving
-        p2b/p3/p_place/p5 as None."""
+        p2b/p3/p_place/p5 as None.
+
+        Builds its own planner/shortcut/spline_opt/q_goal (twice: once for
+        the p2b/p3 leg inside _ignoring_box_collisions, once for
+        p_place/p4/p5 after it exits) rather than taking them as
+        parameters, since each _setup_graph() rebuild that context manager
+        triggers replaces self.problem — any planner built against the old
+        one would be stale."""
         p_retract = None
         p3 = None
         p_place = None
@@ -1355,38 +1429,59 @@ class Orchestrator:
         if self._transition_carry is None:
             return p_retract, p3, p_place, p4, p5
 
-        q_carry = self._find_carry_config(qg)
-        if q_carry is None:
-            return p_retract, p3, p_place, p4, p5
+        # p2b/p3 happen near the pick location, not the drop zone — the
+        # box is irrelevant there. This rebuilds self.problem/self.graph
+        # (see _ignoring_box_collisions), so the planner/shortcut/
+        # spline_opt/q_goal passed in (bound to the pre-rebuild
+        # self.problem) are stale inside this scope — build fresh ones.
+        with self._ignoring_box_collisions():
+            carry_planner = TransitionPlanner(self.problem)
+            carry_planner.maxIterations(1000)
+            carry_shortcut = RandomShortcut(self.problem)
+            carry_spline_opt = SplineGradientBased_bezier3(self.problem)
+            carry_q_goal = np.zeros((1, self.robot.configSize()), order='F')
 
-        carry_start = qg
-        q_retract = self._find_retract_config(qg, qpg)
-        if q_retract is not None:
+            q_carry = self._find_carry_config(qg)
+            if q_carry is None:
+                return p_retract, p3, p_place, p4, p5
+
+            carry_start = qg
+            q_retract = self._find_retract_config(qg, qpg)
+            if q_retract is not None:
+                try:
+                    p_retract = self._plan_transition_path(
+                        carry_planner, carry_q_goal, self._transition_carry,
+                        qg, q_retract, "p2b (retract to handle clearance)"
+                    )
+                    p_retract = self._optimize_path(p_retract, "p2b", carry_shortcut, carry_spline_opt)
+                    self.q_retract = q_retract
+                    carry_start = q_retract
+                except Exception as e:
+                    print(f"  p2b (retract) planning failed: {e}.  Carrying straight from qg.")
+                    p_retract = None
+                    self.q_retract = None
+            else:
+                print("  No retract config found — carrying straight from qg.")
+
             try:
-                p_retract = self._plan_transition_path(
-                    planner, q_goal, self._transition_carry,
-                    qg, q_retract, "p2b (retract to handle clearance)"
+                p3 = self._plan_transition_path(
+                    carry_planner, carry_q_goal, self._transition_carry,
+                    carry_start, q_carry, "p3 (carry to transport pose)"
                 )
-                p_retract = self._optimize_path(p_retract, "p2b", shortcut, spline_opt)
-                self.q_retract = q_retract
-                carry_start = q_retract
+                p3 = self._optimize_path(p3, "p3", carry_shortcut, carry_spline_opt)
+                self.q_carry = q_carry
             except Exception as e:
-                print(f"  p2b (retract) planning failed: {e}.  Carrying straight from qg.")
-                p_retract = None
-                self.q_retract = None
-        else:
-            print("  No retract config found — carrying straight from qg.")
+                print(f"  p3 planning failed: {e}.  Skipping carry phase.")
+                return p_retract, None, None, p4, p5
 
-        try:
-            p3 = self._plan_transition_path(
-                planner, q_goal, self._transition_carry,
-                carry_start, q_carry, "p3 (carry to transport pose)"
-            )
-            p3 = self._optimize_path(p3, "p3", shortcut, spline_opt)
-            self.q_carry = q_carry
-        except Exception as e:
-            print(f"  p3 planning failed: {e}.  Skipping carry phase.")
-            return p_retract, None, None, p4, p5
+        # Box collision restored (self.problem/self.graph rebuilt again)
+        # — rebuild planner/shortcut/spline_opt/q_goal for p_place/p4/p5,
+        # which DO need real box-avoidance.
+        planner = TransitionPlanner(self.problem)
+        planner.maxIterations(1000)
+        shortcut = RandomShortcut(self.problem)
+        spline_opt = SplineGradientBased_bezier3(self.problem)
+        q_goal = np.zeros((1, self.robot.configSize()), order='F')
 
         if self._transition_place is None:
             print("  No place edge — skipping place phase.")
@@ -1531,40 +1626,53 @@ class Orchestrator:
 
         self.problem.constraintGraph(self.graph)
         self._select_best_handle()
-        planner = TransitionPlanner(self.problem)
-        planner.maxIterations(1000)
 
-        shortcut   = RandomShortcut(self.problem)
-        spline_opt = SplineGradientBased_bezier3(self.problem)
-        q_goal = np.zeros((1, self.robot.configSize()), order='F')
+        # p1/p2 happen near the pick location, not the drop zone — the box
+        # is irrelevant there, and self.q_init (the robot's actual current
+        # pose, e.g. right after tuck_arm()) can itself sit in a posture
+        # that overlaps the box depending on where it's configured, which
+        # would otherwise make planPath reject it outright as an invalid
+        # start config. See _ignoring_box_collisions: it rebuilds
+        # self.problem/self.graph, so planner/shortcut/spline_opt must be
+        # constructed AFTER entering, not reused from outside.
+        with self._ignoring_box_collisions():
+            planner = TransitionPlanner(self.problem)
+            planner.maxIterations(1000)
+            shortcut   = RandomShortcut(self.problem)
+            spline_opt = SplineGradientBased_bezier3(self.problem)
+            q_goal = np.zeros((1, self.robot.configSize()), order='F')
 
-        p1, qpg, qg, qg_err = self._find_approach_path(
-            planner, q_goal, max_attempts, seed_candidates=self._seed_candidates
-        )
-        if p1 is None:
-            return False
+            p1, qpg, qg, qg_err = self._find_approach_path(
+                planner, q_goal, max_attempts, seed_candidates=self._seed_candidates
+            )
+            if p1 is None:
+                return False
 
-        print(f"  qg: res=True, err={qg_err:.2e}")
-        p1 = self._optimize_path(
-            p1,
-            "p1",
-            shortcut,
-            spline_opt,
-            shortcut_passes=approach_shortcut_passes,
-            use_spline=approach_use_spline,
-        )
+            print(f"  qg: res=True, err={qg_err:.2e}")
+            p1 = self._optimize_path(
+                p1,
+                "p1",
+                shortcut,
+                spline_opt,
+                shortcut_passes=approach_shortcut_passes,
+                use_spline=approach_use_spline,
+            )
 
-        p2 = self._plan_transition_path(
-            planner, q_goal, self._transition_grasp, qpg, qg, "p2 (grasp)"
-        )
-        p2 = self._optimize_path(p2, "p2", shortcut, spline_opt)
+            p2 = self._plan_transition_path(
+                planner, q_goal, self._transition_grasp, qpg, qg, "p2 (grasp)"
+            )
+            p2 = self._optimize_path(p2, "p2", shortcut, spline_opt)
 
+        # Box collision restored (self.problem/self.graph rebuilt again) —
+        # _plan_carry_place_release opens its own _ignoring_box_collisions
+        # scope for p2b/p3, then plans p_place/p4/p5 (which DO need real
+        # box-avoidance) once that scope exits; it builds its own
+        # planner/shortcut/spline_opt internally rather than reusing
+        # p1/p2's (now stale — see the comment above).
         p4 = p2.reverse()
         print("  p4 ready (release, reversed p2).")
 
-        p_retract, p3, p_place, p4, p5 = self._plan_carry_place_release(
-            planner, q_goal, qg, qpg, p4, shortcut, spline_opt
-        )
+        p_retract, p3, p_place, p4, p5 = self._plan_carry_place_release(qg, qpg, p4)
 
         self.p1       = p1
         self.p2       = p2
@@ -2394,6 +2502,72 @@ class Orchestrator:
             status.append(f"right={np.round(right_arm, 3).tolist()}")
         print(f"sync_from_robot: {'  '.join(status)}")
         return True
+
+    def tuck_arm(self, sync_with_robot: bool = True, sync_timeout: float = 3.0) -> bool:
+        """
+        Recovery utility: send the active arm to its tuck configuration
+        (LEFT_ARM_TUCK) from wherever it currently is, independent of any
+        in-progress plan. Call this after an aborted/failed sequence to
+        reset the arm to a known-safe pose before restarting the demo
+        (plan()/plan_and_execute()).
+        Clears any previously planned phases (p1..p5, p_retract, p_place,
+        p4, p5) — they're stale relative to the arm's new pose.
+        """
+        if sync_with_robot and not self.sync_from_robot(timeout=sync_timeout):
+            print("tuck_arm: could not sync from robot — using last-known q_init.")
+
+        q_seed = np.array(self.q_init).copy()
+        arm_idx = self._active_arm_idx
+        q_seed[arm_idx:arm_idx+7] = LEFT_ARM_TUCK
+
+        # The box is irrelevant to a recovery motion — plan/validate with
+        # it excluded from collision checking (see _ignoring_box_collisions).
+        # This rebuilds self.problem/self.graph/self._transition_* twice
+        # (once with the box excluded, once to restore it), so re-fetch
+        # self._transition_return AFTER entering rather than using a
+        # value captured beforehand.
+        with self._ignoring_box_collisions():
+            transition = self._transition_return
+            if transition is None:
+                print("tuck_arm: no free-state self-loop available — cannot plan tuck motion.")
+                return False
+
+            generated, valid, q_tuck, err = self._generate_valid_config(
+                transition, self.q_init, q_seed
+            )
+            if not generated or not valid:
+                report = self._last_invalid_config_report
+                detail = f" — {report}" if report is not None else ""
+                print(
+                    f"tuck_arm: failed to project tuck config onto free state "
+                    f"(err={err:.2e}){detail}."
+                )
+                return False
+
+            planner = TransitionPlanner(self.problem)
+            planner.maxIterations(1000)
+            shortcut = RandomShortcut(self.problem)
+            spline_opt = SplineGradientBased_bezier3(self.problem)
+            q_goal = np.zeros((1, self.robot.configSize()), order='F')
+            try:
+                p_tuck = self._plan_transition_path(
+                    planner, q_goal, transition,
+                    self.q_init, q_tuck, "recovery (tuck arm)"
+                )
+            except Exception as e:
+                print(f"tuck_arm: path planning failed: {e}")
+                return False
+            p_tuck = self._optimize_path(p_tuck, "tuck", shortcut, spline_opt)
+
+        self.p1 = self.p2 = self.p_retract = self.p3 = self.p_place = self.p4 = self.p5 = None
+        self.qpg = self.qg = self.q_retract = self.q_carry = self.q_drop = None
+
+        self._next_msg_id = 0
+        self._last_hold_msg = None
+        self._last_executed_q = None
+        self._last_executed_label = None
+
+        return self._execute_phase("Recovery: tuck arm", p_tuck, "tuck (arm to tuck pose)", 200)
 
     # ── Gripper control ──────────────────────────────────────────────────────
 

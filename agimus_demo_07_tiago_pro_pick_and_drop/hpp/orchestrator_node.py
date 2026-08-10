@@ -9,6 +9,7 @@ Drops into an IPython shell with the orchestrator pre-loaded:
     o.plan()              # plan approach + grasp + carry + release
     o.execute()           # publish trajectory to MPC controller
     o.plan_and_execute()  # both
+    o.tuck_arm()          # recovery: send arm to tuck pose after a failure
 """
 
 import rclpy
@@ -41,12 +42,13 @@ banner = (
     "║  o.update_object_pose_from_happypose() — move obj from vision  ║\n"
     "║  o.activate_lfc()            — switch to torque control        ║\n"
     "║  o.deactivate_lfc()          — switch back to position control ║\n"
-    "║  o.plan()                    — run HPP planner (p1–p4)         ║\n"
+    "║  o.plan()                    — run HPP planner (p1–p5)         ║\n"
     "║  o.execute()                 — publish full trajectory to MPC  ║\n"
     "║  o.execute([o.p1])           — publish approach only           ║\n"
     "║  o.execute([o.p1, o.p2])     — approach + grasp only           ║\n"
     "║  o.plan_and_execute()        — plan then execute               ║\n"
     "║  o.navigate_to_initial_pose()— send base back to initial point ║\n"
+    "║  o.tuck_arm()                — recovery: send arm to tuck pose ║\n"
     "║  o.compare_pose()            — compare qg vs actual robot pose ║\n"
     "║  o.init_viewer()             — open Viser viewer               ║\n"
     "║  o.view(q)                   — show config in Viser            ║\n"
@@ -54,15 +56,22 @@ banner = (
     "╚══════════════════════════════════════════════════════════╝\n"
     "\n"
     "Phases:\n"
-    "  p1 — approach : arm moves to pre-grasp pose\n"
-    "  p2 — grasp    : arm closes in on object\n"
-    "  p3 — carry    : arm carries object to drop zone  (None if no carry edge)\n"
-    "  p4 — release  : arm retracts (reverse of p2)\n"
-    "  p5 — return   : arm returns to carry pose, empty-handed\n"
+    "  p1  — approach : arm moves to pre-grasp pose\n"
+    "  p2  — grasp    : arm closes in on object\n"
+    "  p2b — retract  : pulls back to the grasped handle's own clearance\n"
+    "                   distance before the big move to the carry pose\n"
+    "  p3  — carry    : arm moves to the transport pose, object grasped\n"
+    "                   (None if no carry edge)\n"
+    "  p_place        : arm moves from the transport pose to the drop zone,\n"
+    "                   after the base has navigated there\n"
+    "  p4  — release  : arm retracts (reverse of p2)\n"
+    "  p5  — return   : arm returns to carry pose, empty-handed\n"
     "  → navigate back to initial point (after p5) — ready for a new cycle\n"
     "\n"
     "  ⚠  Close the physical gripper between p2 and p3.\n"
     "  ⚠  Open the physical gripper after p3 (or p2 if p3 is None).\n"
+    "  ⚠  Sequence aborted or arm in an unknown pose? Call o.tuck_arm() to\n"
+    "     reset it to the tuck configuration before replanning.\n"
 )
 
 # Prefer IPython for a nicer interactive shell (tab-completion, history);
