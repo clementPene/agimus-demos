@@ -40,11 +40,57 @@ tuck:
   left_arm:  [2.8, -1.81, -0.56, -2.20, -2.6, 0.91, -0.26]
   right_arm: [-2.8, -1.81, 0.56, -2.20, 2.6, 0.91, 0.26]
 
-# ── Drop-zone arm configuration ───────────────────────────────────────────────
-# Joint values for arm_left_1 … arm_left_7 where the gripper hovers above
-# the drop zone.  Adjust for your specific setup.
-drop:
-  arm_config: [2.8, -1.81, -0.56, -2.20, -2.6, 0.91, -0.26]
+# ── Carry-position arm configuration ─────────────────────────────────────────
+# Joint values for arm_left_1 … arm_left_7 the arm holds while the object is
+# in transit — reached right after grasping and held through navigation,
+# before the arm moves on to hover above the drop-zone box for placement
+# (see box: below — that target is computed via IK, not hardcoded here).
+# PLACEHOLDER (same as tuck.left_arm) — adjust for your specific setup.
+carry:
+  arm_config: [2.8, -2.12, 2.35, -2.20, -2.6, 0.91, -0.26]
+
+# ── Navigation target (base move between carry and place) ───────────────────
+# Pose sent to the navigate_to_pose action between the carry phase (p3) and
+# the place/release phase (gripper open + p4). PLACEHOLDER — fill in with the
+# real drop-zone pose (map frame) once the location is known.
+nav:
+  target_pose:
+    frame_id: "map"
+    x: 0.0
+    y: 0.0
+    yaw: 0.0
+  # Pose the base returns to after retracting from the drop zone (Phase 4),
+  # so a new pick-and-drop cycle can start from the same place. PLACEHOLDER —
+  # fill in with the real pick-location pose (map frame) once known.
+  initial_pose:
+    frame_id: "map"
+    x: 0.0
+    y: 0.0
+    yaw: 0.0
+
+# ── Drop-zone container ───────────────────────────────────────────────────
+# A box the object is released into during p_place. This IS the source of
+# truth for where p_place ends up — the arm config there is solved via IK
+# (Orchestrator._find_drop_config) to put the grasped object `clearance`
+# above the box's rim, not the other way around: move the box here and
+# p_place follows, no manual arm-config retuning needed. Collision-relevant
+# for p_place/p4/p5 (near the drop zone) only — p1/p2/p3 (near the pick
+# location) explicitly ignore it. Wall/bottom thickness and inner opening
+# are in urdf/box.urdf and must be kept in sync there if changed, same as
+# table.urdf's own hardcoded dimensions.
+#
+# x/y/z are the box's bottom-outer surface (base_link origin in box.urdf),
+# in robot base_link frame. PLACEHOLDER — this puts it resting on the
+# table (z = table top surface, 0.745m — see table.srdf) beside the pick
+# spot (object.x/y is the pick location); fill in the real container
+# position once known.
+box:
+  x: 0.55
+  y: 0.3
+  z: 0.745
+  # How far above the box's rim the grasped object should end up when
+  # p_place completes.
+  clearance: 0.05
 
 # ── MPC weights ───────────────────────────────────────────────────────────────
 weights:

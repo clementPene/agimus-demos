@@ -142,6 +142,7 @@ def launch_setup(
                     for arg in generate_default_tiago_pro_args()
                 },
                 "tuck_arm": "False",
+                "base_type": "omni_base",
                 "is_public_sim": "True",
                 "moveit": "False",
                 "play_motion2": "False",
