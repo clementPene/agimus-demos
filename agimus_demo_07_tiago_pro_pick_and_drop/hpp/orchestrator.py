@@ -4,19 +4,27 @@ HPP pick-and-drop orchestrator for TIAGo Pro — fixed base (left arm only).
 The robot picks a configurable T-LESS object from a table at 74.5 cm height
 using the left arm (pal-pro-gripper), carries it to a configurable drop zone,
 and releases it into a box positioned above the table there (urdf/box.urdf,
-config box.{x,y,z}) — a real HPP collision obstacle for p_place/p4/p5 only;
-p1/p2/p2b/p3 plan with box collision temporarily disabled instead (see
-_ignoring_box_collisions — per-transition security margins don't actually
-suppress a hard collision for config validation in this pyhpp build).
+config box.{x,y,z}). The box is NOT part of the HPP scene while p1/p2/p2b/p3
+plan and execute — it's simply absent from self.robot/self.model (see
+_load_urdf_models) until add_box_to_scene() adds it, right after the base
+has navigated to the drop zone, at which point p_place/p4/p5 are planned
+(see plan_place()) and do collision-check against it for real. Both planning
+and execution are split into matching pick/place entry points: plan_pick()
+and execute_pick() cover p1/p2/p2b/p3 (box-less scene); plan_place() and
+execute_place() cover navigating to the drop zone, adding the box to the
+scene, and p_place/p4/p5 (box present). execute() (auto_gripper mode) just
+calls execute_pick() then execute_place() in sequence; either half is also
+callable on its own.
 
 Interactive usage (IPython):
     o = Orchestrator()
-    o.plan()              # plan p1 (approach) + p2 (grasp) + p2b (retract) + p3 (carry) +
-                           # p_place + p4 (release) + p5 (return to carry pose)
-    o.execute()           # run full sequence: p1 → close gripper → p2b (retract) → p3 →
-                           # navigate → p_place → open gripper → p4 → p5 →
-                           # navigate back to initial point
-    o.plan_and_execute()
+    o.plan_pick()         # plan p1 (approach) + p2 (grasp) + p2b (retract) + p3 (carry)
+    o.execute()           # run full sequence: execute_pick() (p1 → close gripper →
+                           # p2b (retract) → p3) then execute_place() (navigate →
+                           # add box to scene → plan_place() + run p_place →
+                           # open gripper → p4 (release) → p5 (return) →
+                           # navigate back to initial point, box removed again)
+    o.plan_and_execute()  # plan_pick() then execute()
 
 Phase labels:
     p1 — approach  : free arm motion to pre-grasp pose
@@ -26,23 +34,26 @@ Phase labels:
                       to place the pre-grasp waypoint qpg) before the arm makes
                       its large motion to the carry pose in p3
     p3 — carry     : arm moves to a transport pose (CARRY_ARM_CFG) with object grasped
-    p_place        : arm moves from the transport pose to the drop zone, executed
-                      after the base has navigated there. The target arm config is
-                      not hardcoded — it's solved via IK (_find_drop_config) so the
-                      object ends up BOX_CLEARANCE above box.{x,y,z}'s rim, keeping
-                      its grasped orientation. Moving the box in the config moves
-                      where p_place ends up; no manual arm-config retuning needed.
+    p_place        : arm moves from the transport pose to the drop zone, planned and
+                      executed after the base has navigated there and the box has
+                      been added to the scene (add_box_to_scene). The target arm
+                      config is not hardcoded — it's solved via IK (_find_drop_config)
+                      so the object ends up BOX_CLEARANCE above box.{x,y,z}'s rim,
+                      keeping its grasped orientation. Moving the box in the config
+                      moves where p_place ends up; no manual arm-config retuning needed.
     p4 — release   : arm retreats from drop zone (planned from q_drop when carry exists)
     p5 — return    : arm moves back to the transport pose (CARRY_ARM_CFG), empty-handed,
                       before the base navigates back to the initial point
 
-execute() closes the gripper after p2, retracts to the grasped handle's own
-clearance distance (p2b), moves the arm to the transport pose (p3), sends the
-base to NAV_TARGET_{X,Y,YAW} via the navigate_to_pose action, moves the arm on
-to the drop pose (p_place), then opens the gripper and runs p4 (retract)
-followed by p5 (back to the carry pose). Once p5 has run (or been skipped),
-the base navigates back to NAV_INITIAL_{X,Y,YAW} so a new cycle can start
-from the same place, arm already tucked in the carry pose.
+execute_pick() closes the gripper after p2, retracts to the grasped handle's
+own clearance distance (p2b), then moves the arm to the transport pose (p3).
+execute_place() then sends the base to NAV_TARGET_{X,Y,YAW} via the
+navigate_to_pose action, adds the drop-zone box to the HPP scene and plans
+p_place/p4/p5 against it (plan_place()), moves the arm on to the drop pose
+(p_place), opens the gripper and runs p4 (retract) followed by p5 (back to
+the carry pose). Once p5 has run (or been skipped), the base navigates back
+to NAV_INITIAL_{X,Y,YAW} (removing the box from the scene again) so a new
+cycle can start from the same place, arm already tucked in the carry pose.
 Pass auto_gripper=False to stream all phases without gripper/navigation commands.
 """
 
@@ -68,11 +79,11 @@ for _p in sorted(
         sys.path.insert(0, _p)
 
 from pyhpp.manipulation import Device, urdf
-from pyhpp.manipulation import Graph, Problem, TransitionPlanner
+from pyhpp.manipulation import Graph, GraphRandomShortcut, Problem, TransitionPlanner
 from pyhpp.manipulation.constraint_graph_factory import ConstraintGraphFactory
 from pyhpp.manipulation.security_margins import SecurityMargins
 from pyhpp.constraints import ComparisonType, ComparisonTypes, LockedJoint
-from pyhpp.core import RandomShortcut, SplineGradientBased_bezier3
+from pyhpp.core import SplineGradientBased_bezier3
 
 import rclpy
 from rclpy.action import ActionClient
@@ -276,7 +287,7 @@ DEFAULT_FIXED_JOINT_VALUES = (
 )
 # Thresholds for warning that the robot's actual state has drifted from a
 # planned path's start point (see _warn_if_robot_far_from_path_start) —
-# usually a sign that plan() was run against a stale q_init.
+# usually a sign that plan_pick() was run against a stale q_init.
 PATH_START_EE_WARN_MM = 100.0
 PATH_START_JOINT_WARN_RAD = 0.35
 # Publishing the last trajectory point only means the reference has been
@@ -292,6 +303,17 @@ PATH_START_JOINT_WARN_RAD = 0.35
 ARM_SETTLE_EE_POS_TOLERANCE_MM = 15.0  # mm, max end-effector position error to consider the arm "arrived"
 ARM_SETTLE_EE_ROT_TOLERANCE_DEG = 5.0  # deg, max end-effector orientation error to consider the arm "arrived"
 ARM_SETTLE_TIMEOUT = 10.0           # s, max extra wait for /joint_states to confirm arrival
+# agimus_controller_node's trajectory buffer needs >= ocp.horizon_size (50)
+# points queued or it pads the tail with a repeated (stale) point every
+# cycle rather than skipping the solve; publishing at exactly its own 100 Hz
+# consumption rate leaves that buffer with ~zero margin, so it was observed
+# oscillating right on that floor continuously, degrading the OCP's horizon
+# every cycle for big, fast motions like p3. Burst-publish this many
+# messages up front (no DT pacing) before switching to the normal paced
+# loop, so the buffer starts with real headroom instead of teetering on the
+# minimum — 100 matches agimus_controller_node's own "comfortable startup"
+# threshold (buffer_has_enough_data(2) == 2x horizon_size at node init).
+PUBLISH_BURST_COUNT = 100
 # /joint_states may be published with different QoS settings depending on
 # the source node, so we subscribe with all three and take whichever message
 # arrives first.
@@ -322,8 +344,9 @@ class Orchestrator:
 
     Usage (in IPython):
         o = Orchestrator()
-        o.plan()              # generates p1, p2, p3, p4
-        o.execute()           # runs full sequence with automatic gripper control
+        o.plan_pick()         # generates p1, p2, p2b, p3
+        o.execute()           # runs full sequence with automatic gripper control;
+                               # plan_place() runs internally after navigation
         o.execute([o.p1])     # run approach only (no auto-gripper)
     """
 
@@ -338,6 +361,11 @@ class Orchestrator:
         self._next_msg_id = 0
         self._fixed_joint_values = dict(DEFAULT_FIXED_JOINT_VALUES)
         self._obj_name = _DEFAULT_OBJ_NAME
+        # The drop-zone box isn't part of the HPP scene until
+        # add_box_to_scene() adds it, right after the base has navigated
+        # there (see plan_place) — p1/p2/p2b/p3 plan a scene that
+        # genuinely has no box in it.
+        self._box_loaded = False
         self._latest_joint_state_map = {}
         self._joint_state_subs = []
         self._seed_candidates = []
@@ -355,7 +383,7 @@ class Orchestrator:
         self._setup_model()
         print("Building constraint graph …")
         self._setup_graph()
-        print("Orchestrator ready.  Call plan() to start.\n")
+        print("Orchestrator ready.  Call plan_pick() to start.\n")
 
     # ── Model setup ───────────────────────────────────────────────────────────
 
@@ -681,12 +709,10 @@ class Orchestrator:
 
         self._set_obj_bounds(*OBJ_INIT_POS)
         self._set_table_bounds()
-        self._set_box_bounds()
 
         self.q_init = pin.neutral(self.model).copy()
         obj_idx = self._obj_idx
         table_idx = self._table_idx
-        box_idx = self._box_idx
         self._active_arm_home = list(LEFT_ARM_TUCK)
         self._other_arm_lock_values = (
             list(RIGHT_ARM_TUCK) if self._other_arm_idx is not None else []
@@ -698,8 +724,6 @@ class Orchestrator:
         self.q_init[obj_idx+3:obj_idx+7] = [0., 0., 0., 1.]  # identity quaternion
         self.q_init[table_idx:table_idx+3] = [TABLE_OFFSET_X, 0, 0]
         self.q_init[table_idx+3:table_idx+7] = [0., 0., 0., 1.]  # identity quaternion
-        self.q_init[box_idx:box_idx+3] = BOX_POS
-        self.q_init[box_idx+3:box_idx+7] = [0., 0., 0., 1.]  # identity quaternion
 
         self._pin_data = self.model.createData()
         self._ee_frame_id = self.model.getFrameId(self._ee_frame_name)
@@ -733,16 +757,18 @@ class Orchestrator:
             TABLE_URDF, TABLE_SRDF,
             pin.SE3.Identity(),
         )
-        # Drop-zone box: "anchor" (like ground) turned out not to produce a
-        # queryable "box/root_joint" name — setSecurityMarginForTransition
-        # needs a real joint name, so use "freeflyer" + bounds + a
-        # LockedJoint instead, exactly like table (see _set_box_bounds,
-        # _locked_joints), even though the box never actually moves either.
-        urdf.loadModel(
-            robot, 0, "box", "freeflyer",
-            BOX_URDF, BOX_SRDF,
-            pin.SE3.Identity(),
-        )
+        # Drop-zone box: not part of the scene at all until
+        # add_box_to_scene() sets self._box_loaded and rebuilds — it's
+        # irrelevant during p1/p2/p2b/p3 (near the pick location, not the
+        # drop zone), so it simply isn't modeled then. It never moves, so
+        # once loaded it's a fixed "anchor" (like ground) placed directly
+        # at BOX_POS, with no bounds/LockedJoint needed.
+        if self._box_loaded:
+            urdf.loadModel(
+                robot, 0, "box", "anchor",
+                BOX_URDF, BOX_SRDF,
+                pin.SE3(np.eye(3), BOX_POS),
+            )
         self._obj_srdf = _resolve_object_asset_path(_HPP_DIR, ".srdf", self._obj_name)
         self._obj_urdf = _resolve_object_asset_path(
             os.path.join(_PKG_DIR, "urdf"), ".urdf", self._obj_name
@@ -805,7 +831,6 @@ class Orchestrator:
         )
         self._obj_idx       = _idx(f"{self._obj_name}/root_joint")
         self._table_idx     = _idx("table/root_joint")
-        self._box_idx       = _idx("box/root_joint")
 
         # Use LEFT arm for picking (has pal-pro-gripper with actual gripper mechanism)
         self._active_arm_idx = self._left_arm_idx
@@ -853,23 +878,6 @@ class Orchestrator:
             -float("Inf"), float("Inf"),
         ])
 
-    def _set_box_bounds(self, margin: float = 0.001):
-        """Give the drop-zone box's freeflyer root joint a tight but finite
-        translation box, exactly like _set_table_bounds — the box never
-        actually moves; the LockedJoint added in _locked_joints() does the
-        real pinning (including rotation, which bounds cannot constrain on
-        a freeflyer)."""
-        x, y, z = BOX_POS
-        self.robot.setJointBounds("box/root_joint", [
-            x - margin, x + margin,
-            y - margin, y + margin,
-            z - margin, z + margin,
-            -float("Inf"), float("Inf"),
-            -float("Inf"), float("Inf"),
-            -float("Inf"), float("Inf"),
-            -float("Inf"), float("Inf"),
-        ])
-
     # ── Constraint graph setup ─────────────────────────────────────────────────
 
     def _setup_graph(self):
@@ -892,18 +900,19 @@ class Orchestrator:
 
         # Robot/object collision margin is 0 by default; grasp/carry
         # transitions below additionally disable it outright so the gripper
-        # can actually close in on the handle. The box gets a real margin
-        # here too — this applies to every transition (including "place",
-        # created just above, since it already exists in getTransitions()
-        # by this point) — the exemption loop below then disables it again
-        # specifically for approach/grasp/the original carry edge, so only
-        # p_place/p4/p5 actually collision-check against it.
-        security_margins = SecurityMargins(
-            problem, factory, ["tiago_pro", self._obj_name, "table", "box"], robot
-        )
+        # can actually close in on the handle. The box, when loaded (see
+        # add_box_to_scene — it's absent during p1/p2/p2b/p3), gets a real
+        # margin here too, applying to every transition including "carry",
+        # which by the time the box exists is only ever used again for
+        # p_place/p4/p5.
+        margin_entities = ["tiago_pro", self._obj_name, "table"]
+        if self._box_loaded:
+            margin_entities.append("box")
+        security_margins = SecurityMargins(problem, factory, margin_entities, robot)
         security_margins.setSecurityMarginBetween("tiago_pro", self._obj_name, 0.0)
         security_margins.setSecurityMarginBetween("tiago_pro", "table", 0.05)
-        security_margins.setSecurityMarginBetween("tiago_pro", "box", 0.0)
+        if self._box_loaded:
+            security_margins.setSecurityMarginBetween("tiago_pro", "box", 0.0)
         security_margins.apply()
 
         # The active gripper must approach within a few centimeters of the
@@ -932,101 +941,43 @@ class Orchestrator:
                         f"{self._obj_name}/root_joint", float("-inf"),
                     )
 
-        # The drop-zone box is irrelevant during approach/grasp/carry (near
-        # the pick location, not the drop zone) — ignore it there. p_place
-        # ("place", a distinct edge from "carry" — see _make_place_edge),
-        # p4 ("release"), and p5 ("return") keep the default margin set
-        # above, so retreat/return planning actually routes around it.
-        for cand in self._grasp_candidates:
-            for key in ("approach", "grasp", "carry"):
-                edge = cand.get(key)
-                if edge is None:
-                    continue
-                for jname in model.names:
-                    if jname and "/" not in jname:
-                        graph.setSecurityMarginForTransition(
-                            edge, jname, "box/root_joint", float("-inf"),
-                        )
-
         graph.initialize()
 
         self.problem = problem
         self.problem.addConfigValidation("CollisionValidation")
         self.graph   = graph
 
-    @contextmanager
-    def _ignoring_box_collisions(self):
-        """Temporarily exclude every tiago_pro<->box collision pair from
-        collision checking — used by tuck_arm(), where the box is
-        irrelevant to a recovery motion and the canonical tuck posture can
-        coincidentally overlap it depending on where the box is
-        configured.
-
-        Per-transition security margins (the float("-inf") trick used
-        above for approach/grasp/carry) do NOT actually suppress a
-        genuine hard collision for discrete configuration validation in
-        this pyhpp build — confirmed empirically: transitions already
-        "exempted" that way report the exact same collision as
-        non-exempted ones. self.problem snapshots the geometry model's
-        collision pairs when it's constructed (in _setup_graph), so
-        mutating self.robot.geomModel() afterwards has no effect on an
-        already-built self.problem; the pairs must be removed BEFORE
-        _setup_graph() rebuilds the graph, and restored (with the graph
-        rebuilt again) afterwards so p3/p4/p5/p_place keep their own real
-        box-avoidance for the rest of the session.
-
-        Rebuilding the graph like this has two side effects callers must
-        handle themselves: (1) self._transition_* reset to the FIRST
-        grasp candidate (_build_grasp_candidates' default), discarding
-        whatever _select_best_handle() picked — this method re-resolves
-        the previously-selected transitions by name (stable across
-        rebuilds) immediately after each rebuild so callers see the same
-        handle selection before and after; (2) self.problem is a brand
-        new object each rebuild, so any TransitionPlanner/RandomShortcut/
-        SplineGradientBased_bezier3 a caller already constructed against
-        the old self.problem is now stale — callers must construct fresh
-        ones AFTER entering this context (and again after it exits, for
-        anything they still need to plan outside it)."""
-        selected_names = {
+    def _selected_transition_names(self) -> dict:
+        """Snapshot the names of the currently-selected self._transition_*
+        attributes, so they can be re-resolved by name (stable across
+        rebuilds) against a freshly rebuilt self.graph — see
+        _reresolve_selected_transitions."""
+        return {
             attr: getattr(self, attr).name()
             for attr in (
                 "_transition_approach", "_transition_grasp", "_transition_carry",
-                "_transition_place", "_transition_release", "_transition_return",
+                "_transition_release", "_transition_return",
             )
             if getattr(self, attr, None) is not None
         }
 
-        def _restore_selected_handle():
-            for attr, name in selected_names.items():
-                try:
-                    setattr(self, attr, self.graph.getTransition(name))
-                except Exception as e:
-                    print(f"  WARNING: could not re-resolve {attr} ('{name}') after rebuilding the graph: {e}")
-
-        geom_model = self.robot.geomModel()
-        names = [go.name for go in geom_model.geometryObjects]
-        removed = []
-        for cp in list(geom_model.collisionPairs):
-            n1, n2 = names[cp.first], names[cp.second]
-            if (n1.startswith("tiago_pro/") and n2.startswith("box/")) or \
-               (n2.startswith("tiago_pro/") and n1.startswith("box/")):
-                removed.append((cp.first, cp.second))
-        for i1, i2 in removed:
-            geom_model.removeCollisionPair(pin.CollisionPair(i1, i2))
-        self._setup_graph()
-        _restore_selected_handle()
-        try:
-            yield
-        finally:
-            for i1, i2 in removed:
-                geom_model.addCollisionPair(pin.CollisionPair(i1, i2))
-            self._setup_graph()
-            _restore_selected_handle()
+    def _reresolve_selected_transitions(self, selected_names: dict) -> None:
+        """Restore self._transition_* (captured via
+        _selected_transition_names before a _setup_graph() rebuild) by
+        looking them up by name in the new self.graph — a rebuild resets
+        self._transition_* to the first grasp candidate
+        (_build_grasp_candidates' default), discarding whatever
+        _select_best_handle() (or a previous call to this method) picked."""
+        for attr, name in selected_names.items():
+            try:
+                setattr(self, attr, self.graph.getTransition(name))
+            except Exception as e:
+                print(f"  WARNING: could not re-resolve {attr} ('{name}') after rebuilding the graph: {e}")
 
     def _build_grasp_candidates(self, graph):
         """Build one (approach, grasp, carry, release) transition quadruple
         per object handle. Vision can't tell us which handle is actually
-        reachable (e.g. the object detected flipped ~180 deg), so plan()
+        reachable (e.g. the object detected flipped ~180 deg), so plan_pick()
         tries each candidate and picks whichever one actually plans — see
         _select_best_handle(). Defaults self._transition_* to the first
         candidate; _select_best_handle() overrides this once actual
@@ -1044,11 +995,6 @@ class Orchestrator:
                 "approach": transition_approach,
                 "grasp": transition_grasp,
                 "carry": carry_edge,
-                # A second, independent self-loop on the same grasped state
-                # as carry_edge, used for p_place — lets the drop-zone box
-                # carry a security margin distinct from p3's, even though
-                # p3 and p_place are otherwise the same kind of motion.
-                "place": self._make_place_edge(graph, carry_edge) if carry_edge is not None else None,
                 # Reverse edge from grasped back to pre-grasp — used for
                 # release at drop zone.
                 "release": self._find_release_edge(graph, transition_grasp),
@@ -1062,7 +1008,6 @@ class Orchestrator:
         self._transition_approach = default["approach"]
         self._transition_grasp    = default["grasp"]
         self._transition_carry    = default["carry"]
-        self._transition_place    = default["place"]
         self._transition_release  = default["release"]
         self._transition_return   = default["return"]
 
@@ -1106,9 +1051,10 @@ class Orchestrator:
         locked.append(_lock_full_config(
             "table/root_joint", [TABLE_OFFSET_X, 0, 0, 0., 0., 0., 1.]
         ))
-        locked.append(_lock_full_config(
-            "box/root_joint", [*BOX_POS, 0., 0., 0., 1.]
-        ))
+        # The box, once loaded (see add_box_to_scene), is a fixed "anchor"
+        # placed directly at BOX_POS at load time (_load_urdf_models) — it
+        # has no DOF and needs no LockedJoint, unlike table/root_joint
+        # above (a "freeflyer" that's merely pinned in place).
 
         return locked
 
@@ -1187,30 +1133,6 @@ class Orchestrator:
 
         print("  WARNING: return-to-carry edge not found — p5 will be skipped.")
         return None
-
-    @staticmethod
-    def _make_place_edge(graph, carry_transition):
-        """Create a second, independent self-loop on the same grasped state
-        as carry_transition, with identical numerical constraints, so
-        p_place can carry a different security margin (the drop-zone box)
-        than p3 without disturbing p3's own edge. Graph.createTransition is
-        the same primitive ConstraintGraphFactory itself uses internally to
-        build every auto-generated loop edge (see makeLoopTransition in
-        constraint_graph_factory.py) — this just calls it a second time by
-        hand, then copies the original edge's numerical constraints across
-        so the two edges behave identically apart from their margins."""
-        try:
-            state_name, _ = graph.getNodesConnectedByTransition(carry_transition)
-            state = graph.getState(state_name)
-            edge = graph.createTransition(
-                state, state, f"{carry_transition.name()} place", 0, state
-            )
-            ncs = graph.getNumericalConstraintsForEdge(carry_transition)
-            graph.addNumericalConstraintsToTransition(edge, ncs)
-            return edge
-        except Exception as e:
-            print(f"  WARNING: could not create place edge ({e}) — p_place will be skipped.")
-            return None
 
     # ── Planning ──────────────────────────────────────────────────────────────
 
@@ -1404,147 +1326,195 @@ class Orchestrator:
             )
         return None, None, None, None
 
-    def _plan_carry_place_release(self, qg, qpg, fallback_p4):
-        """Plan p2b (retract to handle clearance), p3 (carry to transport
-        pose), p_place (transport pose to drop zone — executed after
-        navigation), p4 (release/retreat) and p5 (return to carry pose,
-        empty-handed, before navigating back to the initial point), if a
-        carry edge exists. Every failure point degrades gracefully rather
-        than aborting the whole plan: no carry edge, no reachable
-        carry/drop config, or a planning exception all fall back to
-        `fallback_p4` (the reversed p2 computed by the caller), leaving
-        p2b/p3/p_place/p5 as None.
-
-        Builds its own planner/shortcut/spline_opt/q_goal (twice: once for
-        the p2b/p3 leg inside _ignoring_box_collisions, once for
-        p_place/p4/p5 after it exits) rather than taking them as
-        parameters, since each _setup_graph() rebuild that context manager
-        triggers replaces self.problem — any planner built against the old
-        one would be stale."""
+    def _plan_carry(self, qg, qpg, fallback_p4):
+        """Plan p2b (retract to handle clearance) and p3 (carry to
+        transport pose), if a carry edge exists and both configs/paths are
+        reachable. p_place/p4 (real release at the drop zone)/p5 are
+        planned later, after navigation — see plan_place(). Every
+        failure point degrades gracefully: no carry edge, no reachable
+        carry config, or a planning exception all leave p3 as None and
+        keep `fallback_p4` (the reversed p2 computed by the caller) as the
+        release path, since without an actual carry there's nothing to
+        navigate to or place."""
         p_retract = None
         p3 = None
-        p_place = None
-        p4 = fallback_p4
-        p5 = None
         if self._transition_carry is None:
-            return p_retract, p3, p_place, p4, p5
+            return p_retract, p3, fallback_p4
 
-        # p2b/p3 happen near the pick location, not the drop zone — the
-        # box is irrelevant there. This rebuilds self.problem/self.graph
-        # (see _ignoring_box_collisions), so the planner/shortcut/
-        # spline_opt/q_goal passed in (bound to the pre-rebuild
-        # self.problem) are stale inside this scope — build fresh ones.
-        with self._ignoring_box_collisions():
-            carry_planner = TransitionPlanner(self.problem)
-            carry_planner.maxIterations(1000)
-            carry_shortcut = RandomShortcut(self.problem)
-            carry_spline_opt = SplineGradientBased_bezier3(self.problem)
-            carry_q_goal = np.zeros((1, self.robot.configSize()), order='F')
-
-            q_carry = self._find_carry_config(qg)
-            if q_carry is None:
-                return p_retract, p3, p_place, p4, p5
-
-            carry_start = qg
-            q_retract = self._find_retract_config(qg, qpg)
-            if q_retract is not None:
-                try:
-                    p_retract = self._plan_transition_path(
-                        carry_planner, carry_q_goal, self._transition_carry,
-                        qg, q_retract, "p2b (retract to handle clearance)"
-                    )
-                    p_retract = self._optimize_path(p_retract, "p2b", carry_shortcut, carry_spline_opt)
-                    self.q_retract = q_retract
-                    carry_start = q_retract
-                except Exception as e:
-                    print(f"  p2b (retract) planning failed: {e}.  Carrying straight from qg.")
-                    p_retract = None
-                    self.q_retract = None
-            else:
-                print("  No retract config found — carrying straight from qg.")
-
-            try:
-                p3 = self._plan_transition_path(
-                    carry_planner, carry_q_goal, self._transition_carry,
-                    carry_start, q_carry, "p3 (carry to transport pose)"
-                )
-                p3 = self._optimize_path(p3, "p3", carry_shortcut, carry_spline_opt)
-                self.q_carry = q_carry
-            except Exception as e:
-                print(f"  p3 planning failed: {e}.  Skipping carry phase.")
-                return p_retract, None, None, p4, p5
-
-        # Box collision restored (self.problem/self.graph rebuilt again)
-        # — rebuild planner/shortcut/spline_opt/q_goal for p_place/p4/p5,
-        # which DO need real box-avoidance.
         planner = TransitionPlanner(self.problem)
         planner.maxIterations(1000)
-        shortcut = RandomShortcut(self.problem)
+        shortcut = GraphRandomShortcut(self.problem)
         spline_opt = SplineGradientBased_bezier3(self.problem)
         q_goal = np.zeros((1, self.robot.configSize()), order='F')
 
-        if self._transition_place is None:
-            print("  No place edge — skipping place phase.")
-            return p_retract, p3, None, p4, p5
+        q_carry = self._find_carry_config(qg)
+        if q_carry is None:
+            return p_retract, p3, fallback_p4
 
-        q_drop = self._find_drop_config(qg)
+        carry_start = qg
+        q_retract = self._find_retract_config(qg, qpg)
+        if q_retract is not None:
+            try:
+                p_retract = self._plan_transition_path(
+                    planner, q_goal, self._transition_carry,
+                    qg, q_retract, "p2b (retract to handle clearance)"
+                )
+                p_retract = self._optimize_path(p_retract, "p2b", shortcut, spline_opt)
+                self.q_retract = q_retract
+                carry_start = q_retract
+            except Exception as e:
+                print(f"  p2b (retract) planning failed: {e}.  Carrying straight from qg.")
+                p_retract = None
+                self.q_retract = None
+        else:
+            print("  No retract config found — carrying straight from qg.")
+
+        try:
+            p3 = self._plan_transition_path(
+                planner, q_goal, self._transition_carry,
+                carry_start, q_carry, "p3 (carry to transport pose)"
+            )
+            p3 = self._optimize_path(p3, "p3", shortcut, spline_opt)
+            self.q_carry = q_carry
+        except Exception as e:
+            print(f"  p3 planning failed: {e}.  Skipping carry phase.")
+            return p_retract, None, fallback_p4
+
+        return p_retract, p3, None
+
+    def _set_box_loaded(self, loaded: bool) -> None:
+        """Add or remove the drop-zone box from the HPP scene by flipping
+        self._box_loaded and rebuilding self.robot/model/graph around it
+        (see _setup_model/_setup_graph), then restoring the robot's real
+        current joint state (sync_from_robot) and the previously selected
+        grasp transitions (_reresolve_selected_transitions) — a rebuild
+        resets both. Idempotent: a no-op if the box is already in the
+        requested state. See add_box_to_scene/remove_box_from_scene."""
+        if self._box_loaded == loaded:
+            return
+        verb = "Adding" if loaded else "Removing"
+        prep = "to" if loaded else "from"
+        print(f"  {verb} drop-zone box {prep} the HPP scene …")
+        selected_names = self._selected_transition_names()
+        self._box_loaded = loaded
+        self._setup_model()
+        # _setup_model() resets q_init's arm slots to LEFT_ARM_TUCK
+        # defaults — sync_from_robot() (which also rebuilds self.graph)
+        # overwrites them with the robot's real, current pose.
+        if not self.sync_from_robot():
+            print(
+                f"  WARNING: could not sync from robot while {verb.lower()} "
+                "the box — q_init keeps its post-rebuild default posture."
+            )
+            self._setup_graph()
+        self._reresolve_selected_transitions(selected_names)
+        if hasattr(self, "_viewer"):
+            self.init_viewer(open=False)
+
+    def add_box_to_scene(self) -> None:
+        """Add the drop-zone box to the HPP scene. Called automatically
+        from navigate_to_drop_zone_and_add_box(), right after the base has
+        finished navigating there, and again defensively from
+        plan_place() — but public and safe to call on its own too (e.g.
+        interactively), since it's idempotent. Before this runs, the box
+        simply isn't part of self.robot/self.model at all (see
+        _load_urdf_models), so p1/p2/p2b/p3 plan a scene that genuinely
+        has no box in it."""
+        self._set_box_loaded(True)
+
+    def remove_box_from_scene(self) -> None:
+        """Remove the drop-zone box from the HPP scene again — the
+        mirror of add_box_to_scene(). Called automatically once the base
+        has navigated back to the initial point (execute_place) and
+        defensively at the start of plan_pick(), so a new pick cycle
+        always plans p1/p2/p2b/p3
+        against a box-less scene regardless of whatever state a previous
+        cycle (or an aborted one) left behind — the box's fixed pose is
+        only meaningful while the base is actually at the drop zone (see
+        module docstring: the whole HPP scene is base-relative). Public
+        and idempotent, so also safe to call on its own."""
+        self._set_box_loaded(False)
+
+    def plan_place(self) -> bool:
+        """Plan p_place (transport pose to drop zone), p4 (release/
+        retreat) and p5 (return to carry pose, empty-handed, before
+        navigating back to the initial point), against the current grasp
+        (self.qg, self.q_carry) once the drop-zone box has been added to
+        the scene. Called from execute_place() right after
+        navigate_to_drop_zone_and_add_box() succeeds (also calls
+        add_box_to_scene() itself — idempotent — so this can be called
+        on its own too). Returns False only on a hard
+        failure (no reachable drop config at all) — p4/p5 degrade
+        gracefully to None on their own failures without failing the
+        whole call, same as before."""
+        self.add_box_to_scene()
+
+        self.p_place = None
+        self.p4 = None
+        self.p5 = None
+
+        planner = TransitionPlanner(self.problem)
+        planner.maxIterations(1000)
+        shortcut = GraphRandomShortcut(self.problem)
+        spline_opt = SplineGradientBased_bezier3(self.problem)
+        q_goal = np.zeros((1, self.robot.configSize()), order='F')
+
+        q_drop = self._find_drop_config(self.qg)
         if q_drop is None:
-            return p_retract, p3, None, p4, p5
+            return False
 
         try:
             p_place = self._plan_transition_path(
-                planner, q_goal, self._transition_place,
-                q_carry, q_drop, "p_place (transport pose to drop zone)"
+                planner, q_goal, self._transition_carry,
+                self.q_carry, q_drop, "p_place (transport pose to drop zone)"
             )
-            p_place = self._optimize_path(p_place, "p_place", shortcut, spline_opt)
+            self.p_place = self._optimize_path(p_place, "p_place", shortcut, spline_opt)
             self.q_drop = q_drop
         except Exception as e:
             print(f"  p_place planning failed: {e}.  Skipping place phase.")
-            return p_retract, p3, None, p4, p5
+            return False
 
         q_predrop = self._find_predrop_config(q_drop)
         if q_predrop is None:
             print("  No pre-drop config — skipping retreat at drop zone.")
             self.q_predrop = None
-            return p_retract, p3, p_place, None, p5
+            return True
 
         try:
             p4 = self._plan_transition_path(
                 planner, q_goal, self._transition_release,
                 q_drop, q_predrop, "p4 (release at drop zone)"
             )
-            p4 = self._optimize_path(p4, "p4", shortcut, spline_opt)
+            self.p4 = self._optimize_path(p4, "p4", shortcut, spline_opt)
             self.q_predrop = q_predrop
         except Exception as ep4:
             print(f"  p4 planning failed: {ep4}.  Skipping retreat at drop zone.")
-            p4 = None
             self.q_predrop = None
-            return p_retract, p3, p_place, p4, p5
+            return True
 
         if self._transition_return is None:
             print("  No return edge — skipping return to carry pose.")
             self.q_return = None
-            return p_retract, p3, p_place, p4, p5
+            return True
 
         q_return = self._find_return_config(q_predrop)
         if q_return is None:
             print("  No return config — skipping return to carry pose.")
             self.q_return = None
-            return p_retract, p3, p_place, p4, p5
+            return True
 
         try:
             p5 = self._plan_transition_path(
                 planner, q_goal, self._transition_return,
                 q_predrop, q_return, "p5 (return to carry pose)"
             )
-            p5 = self._optimize_path(p5, "p5", shortcut, spline_opt)
+            self.p5 = self._optimize_path(p5, "p5", shortcut, spline_opt)
             self.q_return = q_return
         except Exception as ep5:
             print(f"  p5 planning failed: {ep5}.  Skipping return to carry pose.")
-            p5 = None
             self.q_return = None
 
-        return p_retract, p3, p_place, p4, p5
+        return True
 
     def _select_best_handle(self, trial_attempts: int = 30) -> None:
         """Try every candidate handle (see _setup_graph) with a small budget
@@ -1579,12 +1549,11 @@ class Orchestrator:
         self._transition_approach = chosen["approach"]
         self._transition_grasp    = chosen["grasp"]
         self._transition_carry    = chosen["carry"]
-        self._transition_place    = chosen["place"]
         self._transition_release  = chosen["release"]
         self._transition_return   = chosen["return"]
         self._seed_candidates     = chosen["_valid_samples"]
 
-    def plan(
+    def plan_pick(
         self,
         max_attempts: int = 100,
         approach_shortcut_passes: int = 1,
@@ -1603,14 +1572,24 @@ class Orchestrator:
                             carry edge, or no reachable retract config]
             p3 — carry     (grasped loop: q_retract (or qg if p2b was skipped)
                             → q_carry)      [skipped if no carry edge]
-            p_place        (q_carry → q_drop, executed after navigation, on a second
-                            grasped-state self-loop distinct from p3's — see
-                            _make_place_edge — so the drop-zone box's security margin
-                            only applies here, not on p3)
-            p4 — release   (q_drop → pre-drop via release edge; falls back to reversed p2)
+            p4 — release   (q_drop → pre-drop via release edge; falls back to reversed p2
+                            if there's no carry at all)
             p5 — return    (pre-drop → free via return edge, then onto carry pose,
                             empty-handed) [skipped if p4 falls back to reversed p2,
                             or no return edge]
+
+        p_place, p4 (the real release-at-drop-zone version) and p5 are NOT
+        planned here — the drop-zone box isn't even part of the HPP scene
+        yet (see _load_urdf_models/add_box_to_scene), since it's only
+        relevant once the base has actually navigated there. They're
+        planned by plan_place(), called from execute_place() right after
+        navigate_to_drop_zone_and_add_box() succeeds.
+
+        Removes the box from the scene first (remove_box_from_scene,
+        idempotent) so p1/p2/p2b/p3 always plan against a box-less scene
+        even if a previous cycle (or an aborted one) left it loaded —
+        execute_place() normally already removes it once the base has
+        navigated back to the initial point.
 
         By default the approach phase uses lighter post-processing than the later
         phases so a valid p1 is returned sooner. Set
@@ -1621,66 +1600,53 @@ class Orchestrator:
         synchronized from /joint_states so HPP plans in the same torso/head/base
         posture that Gazebo is currently executing.
         """
+        self.remove_box_from_scene()
+
         if sync_with_robot:
             self.sync_from_robot(timeout=sync_timeout)
 
         self.problem.constraintGraph(self.graph)
         self._select_best_handle()
 
-        # p1/p2 happen near the pick location, not the drop zone — the box
-        # is irrelevant there, and self.q_init (the robot's actual current
-        # pose, e.g. right after tuck_arm()) can itself sit in a posture
-        # that overlaps the box depending on where it's configured, which
-        # would otherwise make planPath reject it outright as an invalid
-        # start config. See _ignoring_box_collisions: it rebuilds
-        # self.problem/self.graph, so planner/shortcut/spline_opt must be
-        # constructed AFTER entering, not reused from outside.
-        with self._ignoring_box_collisions():
-            planner = TransitionPlanner(self.problem)
-            planner.maxIterations(1000)
-            shortcut   = RandomShortcut(self.problem)
-            spline_opt = SplineGradientBased_bezier3(self.problem)
-            q_goal = np.zeros((1, self.robot.configSize()), order='F')
+        planner = TransitionPlanner(self.problem)
+        planner.maxIterations(1000)
+        shortcut   = GraphRandomShortcut(self.problem)
+        spline_opt = SplineGradientBased_bezier3(self.problem)
+        q_goal = np.zeros((1, self.robot.configSize()), order='F')
 
-            p1, qpg, qg, qg_err = self._find_approach_path(
-                planner, q_goal, max_attempts, seed_candidates=self._seed_candidates
-            )
-            if p1 is None:
-                return False
+        p1, qpg, qg, qg_err = self._find_approach_path(
+            planner, q_goal, max_attempts, seed_candidates=self._seed_candidates
+        )
+        if p1 is None:
+            return False
 
-            print(f"  qg: res=True, err={qg_err:.2e}")
-            p1 = self._optimize_path(
-                p1,
-                "p1",
-                shortcut,
-                spline_opt,
-                shortcut_passes=approach_shortcut_passes,
-                use_spline=approach_use_spline,
-            )
+        print(f"  qg: res=True, err={qg_err:.2e}")
+        p1 = self._optimize_path(
+            p1,
+            "p1",
+            shortcut,
+            spline_opt,
+            shortcut_passes=approach_shortcut_passes,
+            use_spline=approach_use_spline,
+        )
 
-            p2 = self._plan_transition_path(
-                planner, q_goal, self._transition_grasp, qpg, qg, "p2 (grasp)"
-            )
-            p2 = self._optimize_path(p2, "p2", shortcut, spline_opt)
+        p2 = self._plan_transition_path(
+            planner, q_goal, self._transition_grasp, qpg, qg, "p2 (grasp)"
+        )
+        p2 = self._optimize_path(p2, "p2", shortcut, spline_opt)
 
-        # Box collision restored (self.problem/self.graph rebuilt again) —
-        # _plan_carry_place_release opens its own _ignoring_box_collisions
-        # scope for p2b/p3, then plans p_place/p4/p5 (which DO need real
-        # box-avoidance) once that scope exits; it builds its own
-        # planner/shortcut/spline_opt internally rather than reusing
-        # p1/p2's (now stale — see the comment above).
         p4 = p2.reverse()
         print("  p4 ready (release, reversed p2).")
 
-        p_retract, p3, p_place, p4, p5 = self._plan_carry_place_release(qg, qpg, p4)
+        p_retract, p3, p4 = self._plan_carry(qg, qpg, p4)
 
         self.p1       = p1
         self.p2       = p2
         self.p_retract = p_retract
         self.p3       = p3
-        self.p_place  = p_place
+        self.p_place  = None
         self.p4       = p4
-        self.p5       = p5
+        self.p5       = None
         self.qpg = qpg
         self.qg  = qg
         return True
@@ -1759,16 +1725,15 @@ class Orchestrator:
         here, so bounds are checked explicitly. Try q_carry's own arm
         config first (nearest already-known-valid pose), then qg's, then
         random arm configs within joint limits, validating each against
-        _transition_place until one succeeds.
+        _transition_carry until one succeeds.
 
-        Validates against _transition_place rather than _transition_carry
-        when available — q_drop is where the object actually ends up
-        relative to the drop-zone box, so its own validity must account for
-        the box; _transition_carry has box collision explicitly disabled
-        (it's p3's edge, near the pick location) and would silently accept
-        a q_drop that collides with the box.
+        Called from plan_place(), after add_box_to_scene() has
+        rebuilt the graph with the box present, so _transition_carry's own
+        collision checking already accounts for it — q_drop is where the
+        object actually ends up relative to the drop-zone box, so its
+        validity must account for the box.
         """
-        transition = self._transition_place or self._transition_carry
+        transition = self._transition_carry
         if transition is None:
             return None
 
@@ -2246,7 +2211,7 @@ class Orchestrator:
         print(
             f"WARNING: robot is {pos_err_mm:.1f} mm from the start of {label} "
             f"(max joint delta {joint_err:.3f} rad). "
-            "This path was likely planned from a stale q_init; rerun plan() "
+            "This path was likely planned from a stale q_init; rerun plan_pick() "
             "after sync_from_robot() before executing it."
         )
 
@@ -2352,10 +2317,32 @@ class Orchestrator:
 
         completed = True
         try:
-            for msg in messages:
+            # Burst the first PUBLISH_BURST_COUNT messages with no DT
+            # pacing, giving agimus_controller_node's trajectory buffer
+            # real headroom before settling into the steady paced rate —
+            # see PUBLISH_BURST_COUNT's comment. Consumption there is
+            # timer-driven at its own fixed rate regardless of how fast we
+            # hand it messages, so arriving early only builds lookahead
+            # margin; it doesn't make the robot move any faster.
+            burst_count = min(PUBLISH_BURST_COUNT, len(messages))
+            for msg in messages[:burst_count]:
                 pub.publish(msg)
                 rclpy.spin_once(node, timeout_sec=0.0)
-                time.sleep(DT)
+
+            publish_start = time.monotonic()
+            for i, msg in enumerate(messages[burst_count:]):
+                pub.publish(msg)
+                rclpy.spin_once(node, timeout_sec=0.0)
+                # Deadline-based pacing (mirrors _wait_for_arm_settled /
+                # _spin_future_with_hold): sleeping a fixed DT here, after
+                # doing the publish+spin work, would systematically
+                # undershoot 1/DT Hz by however long that work took each
+                # iteration — compounding over a long phase into a real
+                # drain of the MPC's trajectory buffer.
+                target_time = publish_start + (i + 1) * DT
+                sleep_time = target_time - time.monotonic()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
             node.get_logger().info("Trajectory fully published.")
         except KeyboardInterrupt:
             print("\nExecution interrupted.")
@@ -2369,70 +2356,104 @@ class Orchestrator:
         print(f"\n=== {title} ===")
         return self._execute_paths([(path, label)], n_hold=n_hold)
 
-    def _execute_full_sequence(self) -> bool:
-        """Execute the complete pick-and-drop sequence with automatic gripper
-        control. Aborts and returns False at the first step that fails to
-        settle/complete — in particular, never calls close_gripper() unless
-        Phase 2 was confirmed to have actually reached the grasp pose."""
+    @staticmethod
+    def _abort_sequence(step: str) -> bool:
+        print(f"\n*** ABORTING sequence: {step} did not complete/settle — "
+              "see WARNING above. Fix the issue (e.g. sync_from_robot()) "
+              "and re-run. ***")
+        return False
 
-        def abort(step: str) -> bool:
-            print(f"\n*** ABORTING sequence: {step} did not complete/settle — "
-                  "see WARNING above. Fix the issue (e.g. sync_from_robot()) "
-                  "and re-run. ***")
-            return False
-
+    def execute_pick(self) -> bool:
+        """Execute p1 (approach) through p3 (carry to transport pose),
+        with automatic gripper control: opens the gripper, runs p1/p2,
+        closes the gripper once p2 has settled and verifies the grasp,
+        then runs p2b (retract, if planned) and p3 (carry, if planned).
+        Aborts and returns False at the first step that fails to
+        settle/complete — in particular, never calls close_gripper()
+        unless Phase 2 was confirmed to have actually reached the grasp
+        pose. Called by execute() (auto_gripper mode); also callable on
+        its own."""
         print("\n=== Opening gripper ===")
         if not self.open_gripper():
-            return abort("initial gripper open")
+            return self._abort_sequence("initial gripper open")
 
         if not self._execute_phase("Phase 1: Approach", self.p1, "p1 (approach)", 50):
-            return abort("Phase 1 (approach)")
+            return self._abort_sequence("Phase 1 (approach)")
         if not self._execute_phase("Phase 2: Grasp close-in", self.p2, "p2 (grasp)", 50):
-            return abort("Phase 2 (grasp) — arm not settled at grasp pose, refusing to close gripper")
+            return self._abort_sequence(
+                "Phase 2 (grasp) — arm not settled at grasp pose, refusing to close gripper"
+            )
 
         print("\n=== Closing gripper ===")
         if not self.close_gripper():
-            return abort("gripper close")
+            return self._abort_sequence("gripper close")
         if not self._check_object_grasped():
-            return abort("grasp verification — object not detected in gripper, refusing to carry")
+            return self._abort_sequence(
+                "grasp verification — object not detected in gripper, refusing to carry"
+            )
 
         if self.p_retract is not None:
             if not self._execute_phase(
                 "Phase 2b: Retract to handle clearance", self.p_retract, "p_retract (retract)", 50
             ):
-                return abort("Phase 2b (retract)")
+                return self._abort_sequence("Phase 2b (retract)")
 
         if self.p3 is not None:
             if not self._execute_phase("Phase 3: Carry to transport pose", self.p3, "p3 (carry)", 50):
-                return abort("Phase 3 (carry)")
+                return self._abort_sequence("Phase 3 (carry)")
 
+        return True
+
+    def execute_place(self) -> bool:
+        """Navigate to the drop zone, add the drop-zone box to the HPP
+        scene (navigate_to_drop_zone_and_add_box), plan p_place/p4/p5
+        (plan_place) and execute them, open the gripper, run p4/p5, then
+        navigate back to the initial point and remove the box from the
+        scene again (ready for a new cycle). Aborts and returns False at
+        the first step that fails to settle/complete. Called by
+        execute() (auto_gripper mode) right after execute_pick(); also
+        callable on its own (e.g. to redo just the place/release leg
+        against an already-carried object)."""
         print("\n=== Navigating to drop zone ===")
-        if not self.navigate_to_drop_zone():
-            return abort("navigation to drop zone")
+        if not self.navigate_to_drop_zone_and_add_box():
+            return self._abort_sequence("navigation to drop zone")
+
+        if self.p3 is not None:
+            # p_place/p4/p5 are only planned here, against the robot's
+            # real post-navigation state, now that the drop-zone box is
+            # part of the scene (see navigate_to_drop_zone_and_add_box).
+            if not self.plan_place():
+                return self._abort_sequence("planning place/release after navigation")
 
         if self.p_place is not None:
             if not self._execute_phase("Phase 3b: Place at drop zone", self.p_place, "p_place (place)", 50):
-                return abort("Phase 3b (place)")
+                return self._abort_sequence("Phase 3b (place)")
 
         print("\n=== Opening gripper ===")
         if not self.open_gripper():
-            return abort("post-carry gripper open")
+            return self._abort_sequence("post-carry gripper open")
 
         if self.p4 is not None:
             if not self._execute_phase("Phase 4: Release / retreat", self.p4, "p4 (release)", 200):
-                return abort("Phase 4 (release)")
+                return self._abort_sequence("Phase 4 (release)")
         else:
             print("\n=== Phase 4: Release / retreat skipped ===")
 
         if self.p5 is not None:
             if not self._execute_phase("Phase 5: Return to carry pose", self.p5, "p5 (return to carry)", 50):
-                return abort("Phase 5 (return to carry pose)")
+                return self._abort_sequence("Phase 5 (return to carry pose)")
         else:
             print("\n=== Phase 5: Return to carry pose skipped ===")
 
         print("\n=== Navigating back to initial point ===")
         if not self.navigate_to_initial_pose():
-            return abort("navigation back to initial point")
+            return self._abort_sequence("navigation back to initial point")
+
+        # The box's fixed pose is only meaningful while the base is
+        # actually at the drop zone (the HPP scene is base-relative — see
+        # module docstring) — remove it now that we've navigated away, so
+        # the next cycle's plan_pick() finds a box-less scene, same as this one.
+        self.remove_box_from_scene()
 
         print("\n=== Pick-and-drop complete ===")
         return True
@@ -2452,14 +2473,16 @@ class Orchestrator:
                 auto_gripper=False, all phases are streamed as a single
                 continuous trajectory without gripper/navigation commands.
         auto_gripper : if True (default) and paths is None, gripper and
-                       navigation are handled automatically between phases.
+                       navigation are handled automatically between phases
+                       — see execute_pick()/execute_place(), each callable
+                       on its own too.
 
         Returns True only if every phase (and, in auto_gripper mode, every
         gripper/navigation action) completed and settled; False if the
         sequence was aborted partway through.
         """
         if self.p1 is None:
-            print("No path available — run plan() first.")
+            print("No path available — run plan_pick() first.")
             return False
 
         self._next_msg_id = 0
@@ -2471,7 +2494,9 @@ class Orchestrator:
             return self._execute_paths(self._named_paths(paths))
 
         if auto_gripper:
-            return self._execute_full_sequence()
+            if not self.execute_pick():
+                return False
+            return self.execute_place()
         return self._execute_paths(self._named_paths(self._planned_paths()))
 
     # ── Robot state sync ──────────────────────────────────────────────────────
@@ -2509,7 +2534,7 @@ class Orchestrator:
         (LEFT_ARM_TUCK) from wherever it currently is, independent of any
         in-progress plan. Call this after an aborted/failed sequence to
         reset the arm to a known-safe pose before restarting the demo
-        (plan()/plan_and_execute()).
+        (plan_pick()/plan_and_execute()).
         Clears any previously planned phases (p1..p5, p_retract, p_place,
         p4, p5) — they're stale relative to the arm's new pose.
         """
@@ -2520,44 +2545,37 @@ class Orchestrator:
         arm_idx = self._active_arm_idx
         q_seed[arm_idx:arm_idx+7] = LEFT_ARM_TUCK
 
-        # The box is irrelevant to a recovery motion — plan/validate with
-        # it excluded from collision checking (see _ignoring_box_collisions).
-        # This rebuilds self.problem/self.graph/self._transition_* twice
-        # (once with the box excluded, once to restore it), so re-fetch
-        # self._transition_return AFTER entering rather than using a
-        # value captured beforehand.
-        with self._ignoring_box_collisions():
-            transition = self._transition_return
-            if transition is None:
-                print("tuck_arm: no free-state self-loop available — cannot plan tuck motion.")
-                return False
+        transition = self._transition_return
+        if transition is None:
+            print("tuck_arm: no free-state self-loop available — cannot plan tuck motion.")
+            return False
 
-            generated, valid, q_tuck, err = self._generate_valid_config(
-                transition, self.q_init, q_seed
+        generated, valid, q_tuck, err = self._generate_valid_config(
+            transition, self.q_init, q_seed
+        )
+        if not generated or not valid:
+            report = self._last_invalid_config_report
+            detail = f" — {report}" if report is not None else ""
+            print(
+                f"tuck_arm: failed to project tuck config onto free state "
+                f"(err={err:.2e}){detail}."
             )
-            if not generated or not valid:
-                report = self._last_invalid_config_report
-                detail = f" — {report}" if report is not None else ""
-                print(
-                    f"tuck_arm: failed to project tuck config onto free state "
-                    f"(err={err:.2e}){detail}."
-                )
-                return False
+            return False
 
-            planner = TransitionPlanner(self.problem)
-            planner.maxIterations(1000)
-            shortcut = RandomShortcut(self.problem)
-            spline_opt = SplineGradientBased_bezier3(self.problem)
-            q_goal = np.zeros((1, self.robot.configSize()), order='F')
-            try:
-                p_tuck = self._plan_transition_path(
-                    planner, q_goal, transition,
-                    self.q_init, q_tuck, "recovery (tuck arm)"
-                )
-            except Exception as e:
-                print(f"tuck_arm: path planning failed: {e}")
-                return False
-            p_tuck = self._optimize_path(p_tuck, "tuck", shortcut, spline_opt)
+        planner = TransitionPlanner(self.problem)
+        planner.maxIterations(1000)
+        shortcut = GraphRandomShortcut(self.problem)
+        spline_opt = SplineGradientBased_bezier3(self.problem)
+        q_goal = np.zeros((1, self.robot.configSize()), order='F')
+        try:
+            p_tuck = self._plan_transition_path(
+                planner, q_goal, transition,
+                self.q_init, q_tuck, "recovery (tuck arm)"
+            )
+        except Exception as e:
+            print(f"tuck_arm: path planning failed: {e}")
+            return False
+        p_tuck = self._optimize_path(p_tuck, "tuck", shortcut, spline_opt)
 
         self.p1 = self.p2 = self.p_retract = self.p3 = self.p_place = self.p4 = self.p5 = None
         self.qpg = self.qg = self.q_retract = self.q_carry = self.q_drop = None
@@ -2701,6 +2719,20 @@ class Orchestrator:
             NAV_TARGET_FRAME, NAV_TARGET_X, NAV_TARGET_Y, NAV_TARGET_YAW,
             "drop zone", timeout=timeout,
         )
+
+    def navigate_to_drop_zone_and_add_box(self, timeout: float = 10.0) -> bool:
+        """Send the base to the drop zone (navigate_to_drop_zone) and, once
+        it has actually arrived, add the drop-zone box to the HPP scene
+        (add_box_to_scene) — the box is otherwise absent from the scene
+        the whole time p1/p2/p2b/p3 plan and execute (see module
+        docstring). Returns False without touching the scene if navigation
+        itself fails. Called from execute_place(); also callable
+        on its own to inspect/debug the scene switch independently of
+        planning p_place/p4/p5 (plan_place)."""
+        if not self.navigate_to_drop_zone(timeout=timeout):
+            return False
+        self.add_box_to_scene()
+        return True
 
     def navigate_to_initial_pose(self, timeout: float = 10.0) -> bool:
         """Send the base back to NAV_INITIAL_{X,Y,YAW} via the
@@ -3039,7 +3071,7 @@ class Orchestrator:
                 q_ref = np.array(self.qg, copy=True)
                 ref_label = "qg (default grasp reference)"
             else:
-                print("No reference pose available — run plan() or pass q_ref explicitly.")
+                print("No reference pose available — run plan_pick() or pass q_ref explicitly.")
                 return
         elif hasattr(q_ref, "timeRange"):
             q_ref = np.array(q_ref.eval(q_ref.timeRange().second)[0], copy=True)
@@ -3160,6 +3192,6 @@ class Orchestrator:
     # ── Combined ──────────────────────────────────────────────────────────────
 
     def plan_and_execute(self, max_attempts: int = 100) -> bool:
-        if self.plan(max_attempts=max_attempts):
+        if self.plan_pick(max_attempts=max_attempts):
             return self.execute()
         return False

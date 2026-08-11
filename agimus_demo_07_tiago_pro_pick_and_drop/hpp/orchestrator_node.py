@@ -6,9 +6,16 @@ Run after sourcing ros2_config.sh, ros2_ws/install/setup.bash, and hpp_config.sh
 
 Drops into an IPython shell with the orchestrator pre-loaded:
 
-    o.plan()              # plan approach + grasp + carry + release
-    o.execute()           # publish trajectory to MPC controller
-    o.plan_and_execute()  # both
+    o.plan_pick()         # plan approach + grasp + carry (p1-p3)
+    o.execute_pick()      # execute p1-p3: gripper close, grasp check, carry
+    o.execute_place()     # navigate to drop zone, add box, plan_place(),
+                           # execute p_place/p4/p5, navigate back, remove box
+    o.execute()           # execute_pick() then execute_place()
+    o.plan_place()        # plan place/release on its own (normally called
+                           # by execute_place() itself, right after navigation)
+    o.add_box_to_scene()  # manually add the drop-zone box to the HPP scene
+    o.remove_box_from_scene()  # manually remove it again
+    o.plan_and_execute()  # plan_pick() then execute()
     o.tuck_arm()          # recovery: send arm to tuck pose after a failure
 """
 
@@ -42,11 +49,18 @@ banner = (
     "║  o.update_object_pose_from_happypose() — move obj from vision  ║\n"
     "║  o.activate_lfc()            — switch to torque control        ║\n"
     "║  o.deactivate_lfc()          — switch back to position control ║\n"
-    "║  o.plan()                    — run HPP planner (p1–p5)         ║\n"
-    "║  o.execute()                 — publish full trajectory to MPC  ║\n"
+    "║  o.plan_pick()                — run HPP planner (p1–p3)        ║\n"
+    "║  o.execute_pick()            — execute p1–p3 (gripper + carry) ║\n"
+    "║  o.execute_place()           — nav + box + plan_place() + run  ║\n"
+    "║                                 p_place/p4/p5, nav back         ║\n"
+    "║  o.execute()                 — execute_pick() + execute_place()║\n"
     "║  o.execute([o.p1])           — publish approach only           ║\n"
     "║  o.execute([o.p1, o.p2])     — approach + grasp only           ║\n"
-    "║  o.plan_and_execute()        — plan then execute               ║\n"
+    "║  o.plan_and_execute()        — plan_pick() then execute()      ║\n"
+    "║  o.navigate_to_drop_zone_and_add_box() — nav + switch scene    ║\n"
+    "║  o.plan_place()              — plan p_place/p4/p5 on its own   ║\n"
+    "║  o.add_box_to_scene()        — manually add box to HPP scene   ║\n"
+    "║  o.remove_box_from_scene()   — manually remove box from scene  ║\n"
     "║  o.navigate_to_initial_pose()— send base back to initial point ║\n"
     "║  o.tuck_arm()                — recovery: send arm to tuck pose ║\n"
     "║  o.compare_pose()            — compare qg vs actual robot pose ║\n"
@@ -62,9 +76,13 @@ banner = (
     "                   distance before the big move to the carry pose\n"
     "  p3  — carry    : arm moves to the transport pose, object grasped\n"
     "                   (None if no carry edge)\n"
-    "  p_place        : arm moves from the transport pose to the drop zone,\n"
-    "                   after the base has navigated there\n"
-    "  p4  — release  : arm retracts (reverse of p2)\n"
+    "  p_place        : arm moves from the transport pose to the drop zone —\n"
+    "                   planned by execute_place() itself, after the base has\n"
+    "                   navigated there and the drop-zone box has been\n"
+    "                   added to the HPP scene (None right after plan_pick())\n"
+    "  p4  — release  : arm retreats from the drop zone (reverse of p2 if\n"
+    "                   there was no carry at all — planned by execute_place()\n"
+    "                   alongside p_place otherwise)\n"
     "  p5  — return   : arm returns to carry pose, empty-handed\n"
     "  → navigate back to initial point (after p5) — ready for a new cycle\n"
     "\n"
@@ -83,7 +101,7 @@ except ImportError:
     import code
     code.interact(banner=banner, local={"o": o, "rclpy": rclpy})
 
-# o._ros_node is only created lazily (by plan()/execute()/etc.), so it may
+# o._ros_node is only created lazily (by plan_pick()/execute()/etc.), so it may
 # still be None here if the user never triggered ROS communication.
 if o._ros_node is not None:
     o._ros_node.destroy_node()

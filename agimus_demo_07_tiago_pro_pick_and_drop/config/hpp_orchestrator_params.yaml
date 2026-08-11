@@ -45,7 +45,13 @@ tuck:
 # in transit — reached right after grasping and held through navigation,
 # before the arm moves on to hover above the drop-zone box for placement
 # (see box: below — that target is computed via IK, not hardcoded here).
-# PLACEHOLDER (same as tuck.left_arm) — adjust for your specific setup.
+# Same as tuck.left_arm — the previous value [2.8, -2.12, 2.35, -2.20, -2.6,
+# 0.91, -0.26] put joints 2/3/4 within 8-13 degrees of their hard limits
+# (confirmed via the Pinocchio model's own lowerPositionLimit/
+# upperPositionLimit), which is the actual root cause of p3 never settling
+# in Gazebo — not a timing/buffer issue. tuck.left_arm reaches a different
+# end-effector point but has far better margins (31/110 degrees on joints
+# 2/3) and is already proven safe by tuck_arm().
 carry:
   arm_config: [2.8, -2.12, 2.35, -2.20, -2.6, 0.91, -0.26]
 
