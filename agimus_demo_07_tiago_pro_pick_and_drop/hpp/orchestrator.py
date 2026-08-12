@@ -313,7 +313,7 @@ ARM_SETTLE_TIMEOUT = 10.0           # s, max extra wait for /joint_states to con
 # loop, so the buffer starts with real headroom instead of teetering on the
 # minimum — 100 matches agimus_controller_node's own "comfortable startup"
 # threshold (buffer_has_enough_data(2) == 2x horizon_size at node init).
-PUBLISH_BURST_COUNT = 100
+PUBLISH_BURST_COUNT = 50
 # /joint_states may be published with different QoS settings depending on
 # the source node, so we subscribe with all three and take whichever message
 # arrives first.
@@ -355,6 +355,11 @@ class Orchestrator:
         self.p1 = self.p2 = self.p_retract = self.p3 = self.p_place = self.p4 = self.p5 = None
         self.qpg = self.qg = self.q_retract = self.q_carry = self.q_drop = None
         self._messages = None
+        # Memoizes _sample_path() by id(path) — see that method and the
+        # prefetch calls at the end of plan_pick()/plan_place() — so the
+        # per-path sampling cost is paid right after planning instead of
+        # stalling execute_pick()/execute_place() between phases.
+        self._sampled_path_cache = {}
         self._last_hold_msg = None
         self._last_executed_q = None
         self._last_executed_label = None
@@ -1447,6 +1452,14 @@ class Orchestrator:
         failure (no reachable drop config at all) — p4/p5 degrade
         gracefully to None on their own failures without failing the
         whole call, same as before."""
+        result = self._plan_place_impl()
+        # Prefetch regardless of exactly how far _plan_place_impl got —
+        # whichever of p_place/p4/p5 it managed to set, sample it now
+        # rather than stalling execute_place() between phases.
+        self._prefetch_sampled_paths(self.p_place, self.p4, self.p5)
+        return result
+
+    def _plan_place_impl(self) -> bool:
         self.add_box_to_scene()
 
         self.p_place = None
@@ -1600,6 +1613,13 @@ class Orchestrator:
         synchronized from /joint_states so HPP plans in the same torso/head/base
         posture that Gazebo is currently executing.
         """
+        # Start-of-cycle reset: once self.p1..p5 get reassigned below, the
+        # previous cycle's Path objects become unreferenced and eligible
+        # for garbage collection — id() can then be reused for unrelated
+        # objects, which would make a stale _sampled_path_cache entry
+        # match by accident. Clearing it here, before any new path exists,
+        # closes that window entirely.
+        self._sampled_path_cache = {}
         self.remove_box_from_scene()
 
         if sync_with_robot:
@@ -1649,6 +1669,7 @@ class Orchestrator:
         self.p5       = None
         self.qpg = qpg
         self.qg  = qg
+        self._prefetch_sampled_paths(self.p1, self.p2, self.p_retract, self.p3)
         return True
 
     def _find_carry_config(self, qg):
@@ -1860,7 +1881,19 @@ class Orchestrator:
         arm-only position/velocity/acceleration arrays for the MPC
         controller. HPP paths only give positions, so velocity/acceleration
         are derived by finite differences; the last row of each is just
-        repeated once to keep all three arrays the same length."""
+        repeated once to keep all three arrays the same length.
+
+        Memoized by (id(path), time_scale) — a Path object is immutable
+        once planned, so the same path always resamples to the same
+        arrays. This lets callers prefetch the (CPU-bound) sampling right
+        after planning (see plan_pick()/plan_place()) instead of paying
+        it on the execute_pick()/execute_place() critical path between
+        phases."""
+        cache_key = (id(path), time_scale)
+        cached = self._sampled_path_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         tr = path.timeRange()
         t_min, t_max = tr.first, tr.second
         n = max(2, int((t_max - t_min) * time_scale / DT))
@@ -1872,6 +1905,7 @@ class Orchestrator:
         ddq_arr = np.diff(dq_arr, axis=0) / DT
         ddq_arr = np.vstack([ddq_arr, ddq_arr[-1]])
 
+        self._sampled_path_cache[cache_key] = (q_arr, dq_arr, ddq_arr)
         return q_arr, dq_arr, ddq_arr
 
     def _fk_ee(self, q_arm: np.ndarray) -> pin.SE3:
@@ -2110,6 +2144,26 @@ class Orchestrator:
                 print(f"  ... waiting for gripper service response (elapsed {now - start:.1f}s)")
                 next_progress = now + 1.0
 
+    def _prefetch_sampled_paths(self, *paths) -> None:
+        """Eagerly run _sample_path() on each non-None path — called right
+        after plan_pick()/plan_place() so the CPU-bound sampling cost
+        (see _sample_path's memoization) is paid while nothing is
+        watching the robot yet, instead of stalling
+        execute_pick()/execute_place() between phases."""
+        for path in paths:
+            if path is not None:
+                self._sample_path(path, time_scale=self._time_scale_for(path))
+
+    def _time_scale_for(self, path) -> float:
+        """The `time_scale` _sample_path() should use for `path` — slower
+        (CARRY_TIME_SCALE) for the carry-type phases (p2b/p3/p_place/p5),
+        the default (TIME_SCALE) for everything else. Shared by
+        _build_messages() and the plan_pick()/plan_place() prefetch calls
+        so both agree on the same cache key."""
+        if path is self.p_retract or path is self.p3 or path is self.p_place or path is self.p5:
+            return CARRY_TIME_SCALE
+        return TIME_SCALE
+
     def _build_messages(self, paths: list, n_hold: int = 200) -> list:
         """Sample each (path, label) pair into MpcInput messages, then
         append n_hold extra messages at the final position with zero
@@ -2120,8 +2174,7 @@ class Orchestrator:
         msgs = []
         idx = self._next_msg_id
         for path, label in paths:
-            time_scale = CARRY_TIME_SCALE if (path is self.p_retract or path is self.p3 or path is self.p_place or path is self.p5) else TIME_SCALE
-            q_arr, dq_arr, ddq_arr = self._sample_path(path, time_scale=time_scale)
+            q_arr, dq_arr, ddq_arr = self._sample_path(path, time_scale=self._time_scale_for(path))
             print(f"  {label}: {len(q_arr)} waypoints")
             for q, dq, ddq in zip(q_arr, dq_arr, ddq_arr):
                 msgs.append(self._build_msg(q, dq, ddq, idx))
@@ -2287,12 +2340,20 @@ class Orchestrator:
         )
         return False
 
-    def _execute_paths(self, named_paths: list, n_hold: int = 200) -> bool:
+    def _execute_paths(
+        self, named_paths: list, n_hold: int = 200, wait_for_settle: bool = True
+    ) -> bool:
         """Build and publish MpcInput messages for the given (path, label)
-        pairs. Returns True only if the trajectory streamed to completion and
-        the arm was confirmed (via /joint_states) to have settled at its
-        final waypoint — callers must check this before treating the motion
-        as done (e.g. before firing a gripper command)."""
+        pairs. When wait_for_settle is True (default), only returns once the
+        arm was confirmed (via /joint_states) to have settled at its final
+        waypoint — callers must check this before treating the motion as
+        done (e.g. before firing a gripper command). Pass
+        wait_for_settle=False for a transition nothing downstream depends
+        on settling for (e.g. the next call is just another path, not a
+        gripper/grasp-check/navigation action) — the n_hold padding at the
+        tail of `messages` already gives the controller a stable target to
+        keep converging toward while the next phase's own messages start
+        arriving, so there's no need to block here waiting for it."""
         named_paths = [(path, label) for path, label in named_paths if path is not None]
         if not named_paths:
             print("No paths to execute.")
@@ -2350,11 +2411,17 @@ class Orchestrator:
 
         if not completed:
             return False
+        if not wait_for_settle:
+            return True
         return self._wait_for_arm_settled(node)
 
-    def _execute_phase(self, title: str, path, label: str, n_hold: int) -> bool:
+    def _execute_phase(
+        self, title: str, path, label: str, n_hold: int, wait_for_settle: bool = True
+    ) -> bool:
         print(f"\n=== {title} ===")
-        return self._execute_paths([(path, label)], n_hold=n_hold)
+        return self._execute_paths(
+            [(path, label)], n_hold=n_hold, wait_for_settle=wait_for_settle
+        )
 
     @staticmethod
     def _abort_sequence(step: str) -> bool:
@@ -2377,7 +2444,12 @@ class Orchestrator:
         if not self.open_gripper():
             return self._abort_sequence("initial gripper open")
 
-        if not self._execute_phase("Phase 1: Approach", self.p1, "p1 (approach)", 50):
+        # p1 is immediately followed by p2, not a gripper/grasp-check/
+        # navigation action — no need to block waiting for full EE
+        # settling before continuing straight on to p2.
+        if not self._execute_phase(
+            "Phase 1: Approach", self.p1, "p1 (approach)", 50, wait_for_settle=False
+        ):
             return self._abort_sequence("Phase 1 (approach)")
         if not self._execute_phase("Phase 2: Grasp close-in", self.p2, "p2 (grasp)", 50):
             return self._abort_sequence(
@@ -2393,8 +2465,14 @@ class Orchestrator:
             )
 
         if self.p_retract is not None:
+            # p2b is immediately followed by p3 when it exists — same
+            # reasoning as p1 above, no action depends on settling there.
+            # But when there's no p3 (carry planning failed/skipped), p2b
+            # is followed directly by execute_place()'s navigation — keep
+            # settling in that case, same as p3/p5's own transitions.
             if not self._execute_phase(
-                "Phase 2b: Retract to handle clearance", self.p_retract, "p_retract (retract)", 50
+                "Phase 2b: Retract to handle clearance", self.p_retract, "p_retract (retract)", 50,
+                wait_for_settle=(self.p3 is None),
             ):
                 return self._abort_sequence("Phase 2b (retract)")
 
@@ -2434,7 +2512,15 @@ class Orchestrator:
             return self._abort_sequence("post-carry gripper open")
 
         if self.p4 is not None:
-            if not self._execute_phase("Phase 4: Release / retreat", self.p4, "p4 (release)", 200):
+            # p4 is immediately followed by p5 when it exists — same
+            # reasoning as p1/p2b, no action depends on settling there.
+            # But when there's no p5, p4 is followed directly by
+            # navigate_to_initial_pose() — keep the same base-motion
+            # safety margin as p3/p5 below in that case.
+            if not self._execute_phase(
+                "Phase 4: Release / retreat", self.p4, "p4 (release)", 200,
+                wait_for_settle=(self.p5 is None),
+            ):
                 return self._abort_sequence("Phase 4 (release)")
         else:
             print("\n=== Phase 4: Release / retreat skipped ===")
@@ -2985,6 +3071,10 @@ class Orchestrator:
         # drop them so execute()/compare_pose() can't use them by accident.
         self.p1 = self.p2 = self.p_retract = self.p3 = self.p_place = self.p4 = self.p5 = None
         self.qpg = self.qg = self.q_retract = self.q_carry = self.q_drop = None
+        # Also drop cached sampling for those now-dropped paths — their
+        # id() could otherwise be reused by an unrelated later Path,
+        # producing a stale cache hit (see _sample_path).
+        self._sampled_path_cache = {}
         if hasattr(self, "_viewer"):
             # init_viewer() rebuilds the Viewer against the new
             # self.robot/problem/graph and reloads its mesh geometry —

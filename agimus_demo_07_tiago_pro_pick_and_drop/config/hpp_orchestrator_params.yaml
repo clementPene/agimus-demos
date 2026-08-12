@@ -7,8 +7,8 @@
 # ── Trajectory sampling ───────────────────────────────────────────────────────
 trajectory:
   dt: 0.01          # sampling period (s) — must match agimus_controller rate
-  time_scale: 1.6   # stretch HPP path time further so the arm settles with less overshoot while keeping the same final pose
-  carry_time_scale: 1.3   # faster than time_scale so p3 does not drag in Gazebo, but not as fast as 1.0 — gives the controller more margin to track the carry motion (1.0 was seen to intermittently lose tracking)
+  time_scale: 1.3   # stretch HPP path time further so the arm settles with less overshoot while keeping the same final pose — lowered from 1.6 (2026-08-12) to cut wall-clock motion time under Gazebo's <1.0 real-time factor; revert toward 1.6 if p1/p2/p4 start overshooting/losing tracking
+  carry_time_scale: 1.15   # faster than time_scale so p3 does not drag in Gazebo, but not as fast as 1.0 — gives the controller more margin to track the carry motion (1.0 was seen to intermittently lose tracking). Lowered from 1.3 (2026-08-12); stay above 1.0, the known failure point
 
 # ── Configurable T-LESS object ───────────────────────────────────────────────
 # Shipped object assets: obj_01, obj_20, obj_21, obj_22, obj_23, obj_23,
