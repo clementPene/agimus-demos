@@ -24,7 +24,7 @@ Interactive usage (IPython):
                            # add box to scene → plan_place() + run p_place →
                            # open gripper → p4 (release) → p5 (return) →
                            # navigate back to initial point, box removed again)
-    o.plan_and_execute()  # plan_pick() then execute()
+    o.plan_and_execute_full()  # plan_pick() then execute() then tuck_arm()
 
 Phase labels:
     p1 — approach  : free arm motion to pre-grasp pose
@@ -302,7 +302,7 @@ PATH_START_JOINT_WARN_RAD = 0.35
 # (what actually matters for approach/grasp) has arrived.
 ARM_SETTLE_EE_POS_TOLERANCE_MM = 15.0  # mm, max end-effector position error to consider the arm "arrived"
 ARM_SETTLE_EE_ROT_TOLERANCE_DEG = 5.0  # deg, max end-effector orientation error to consider the arm "arrived"
-ARM_SETTLE_TIMEOUT = 10.0           # s, max extra wait for /joint_states to confirm arrival
+ARM_SETTLE_TIMEOUT = 50.0           # s, max extra wait for /joint_states to confirm arrival
 # agimus_controller_node's trajectory buffer needs >= ocp.horizon_size (50)
 # points queued or it pads the tail with a repeated (stale) point every
 # cycle rather than skipping the solve; publishing at exactly its own 100 Hz
@@ -377,11 +377,15 @@ class Orchestrator:
         # Grasping isn't reliable in simulation — set this to False to skip
         # _check_object_grasped()'s abort when the topic is technically
         # published but always reports no grasp (e.g. Gazebo testing).
+        # Defaults to True here (safe for real hardware); orchestrator_node.py
+        # — the interactive Gazebo entry point — overrides it to False.
         self.enforce_grasp_check = True
         # Navigation isn't always reliable/available in simulation — set this
         # to False to skip actually sending navigate_to_pose goals and
         # pretend the base arrived immediately (e.g. when testing the rest
         # of the cycle without a working nav2 stack).
+        # Defaults to True here (safe for real hardware); orchestrator_node.py
+        # — the interactive Gazebo entry point — overrides it to False.
         self.enforce_navigation = True
 
         print("Loading HPP model …")
@@ -2620,7 +2624,9 @@ class Orchestrator:
         (LEFT_ARM_TUCK) from wherever it currently is, independent of any
         in-progress plan. Call this after an aborted/failed sequence to
         reset the arm to a known-safe pose before restarting the demo
-        (plan_pick()/plan_and_execute()).
+        (plan_pick()/plan_and_execute_full()). Also called by
+        plan_and_execute_full() itself at the very end of a successful
+        cycle, so the arm is already tucked and ready before the next one.
         Clears any previously planned phases (p1..p5, p_retract, p_place,
         p4, p5) — they're stale relative to the arm's new pose.
         """
@@ -3281,7 +3287,23 @@ class Orchestrator:
 
     # ── Combined ──────────────────────────────────────────────────────────────
 
-    def plan_and_execute(self, max_attempts: int = 100) -> bool:
-        if self.plan_pick(max_attempts=max_attempts):
-            return self.execute()
-        return False
+    def plan_and_execute_full(self, max_attempts: int = 100) -> bool:
+        """Run a complete pick-and-drop cycle end to end: plan_pick(), then
+        execute() (execute_pick() followed by execute_place() — navigate to
+        the drop zone, add the box, plan_place(), run p_place/p4/p5,
+        navigate back to the initial point), then tuck_arm() so the arm is
+        already in its known-safe tuck pose and ready for the next cycle.
+        Aborts (without tucking) at the first stage that fails.
+
+        execute_place() already removes the drop-zone box from the HPP
+        scene right after navigating back to the initial point, but that
+        call is repeated here too — explicitly, defensively, and it's a
+        no-op if the box is already gone (see remove_box_from_scene) — so
+        this entry point never leaves the scene box-loaded even if that
+        internal step were ever skipped or changed."""
+        if not self.plan_pick(max_attempts=max_attempts):
+            return False
+        if not self.execute():
+            return False
+        self.remove_box_from_scene()
+        return self.tuck_arm()

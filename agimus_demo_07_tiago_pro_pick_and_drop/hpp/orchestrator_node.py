@@ -10,12 +10,11 @@ Drops into an IPython shell with the orchestrator pre-loaded:
     o.execute_pick()      # execute p1-p3: gripper close, grasp check, carry
     o.execute_place()     # navigate to drop zone, add box, plan_place(),
                            # execute p_place/p4/p5, navigate back, remove box
-    o.execute()           # execute_pick() then execute_place()
     o.plan_place()        # plan place/release on its own (normally called
                            # by execute_place() itself, right after navigation)
     o.add_box_to_scene()  # manually add the drop-zone box to the HPP scene
     o.remove_box_from_scene()  # manually remove it again
-    o.plan_and_execute()  # plan_pick() then execute()
+    o.plan_and_execute_full()  # plan_pick() then execute() then tuck_arm()
     o.tuck_arm()          # recovery: send arm to tuck pose after a failure
 """
 
@@ -35,6 +34,15 @@ rclpy.init()
 
 o = Orchestrator()
 
+# Simulation defaults: grasp contact and base navigation aren't reliable
+# (or, for navigation, even meaningfully configured — see nav.target_pose/
+# nav.initial_pose's PLACEHOLDER poses in hpp_orchestrator_params.yaml) in
+# Gazebo, so skip both checks by default here. This is the interactive sim
+# entry point, not the Orchestrator class default (still True there) — set
+# both back to True before running against a real robot.
+o.enforce_grasp_check = False
+o.enforce_navigation = False
+
 banner = (
     "\n"
     "╔══════════════════════════════════════════════════════════╗\n"
@@ -43,20 +51,18 @@ banner = (
     "║  o.sync_from_robot()         — sync q_init from robot state    ║\n"
     "║  o.open_gripper()            — open the left gripper in Gazebo ║\n"
     "║  o.close_gripper()           — close the left gripper in Gazebo║\n"
-    "║  o.enforce_grasp_check = False — skip grasp verify (sim)       ║\n"
-    "║  o.enforce_navigation = False — fake navigation (sim)          ║\n"
+    "║  o.enforce_grasp_check — already False here (sim; True=real)   ║\n"
+    "║  o.enforce_navigation  — already False here (sim; True=real)   ║\n"
     "║  o.update_object_pose(t, q)  — update obj position in q_init   ║\n"
     "║  o.update_object_pose_from_happypose() — move obj from vision  ║\n"
     "║  o.activate_lfc()            — switch to torque control        ║\n"
     "║  o.deactivate_lfc()          — switch back to position control ║\n"
     "║  o.plan_pick()                — run HPP planner (p1–p3)        ║\n"
     "║  o.execute_pick()            — execute p1–p3 (gripper + carry) ║\n"
-    "║  o.execute_place()           — nav + box + plan_place() + run  ║\n"
-    "║                                 p_place/p4/p5, nav back         ║\n"
-    "║  o.execute()                 — execute_pick() + execute_place()║\n"
+    "║  o.execute_place()           — execute p_place/p4/p5, nav back         ║\n"
     "║  o.execute([o.p1])           — publish approach only           ║\n"
     "║  o.execute([o.p1, o.p2])     — approach + grasp only           ║\n"
-    "║  o.plan_and_execute()        — plan_pick() then execute()      ║\n"
+    "║  o.plan_and_execute_full()        — plan_pick() then execute() then  nav + box + plan_place() + then execute_place()  + nav_init + tuck arm   ║\n"
     "║  o.navigate_to_drop_zone_and_add_box() — nav + switch scene    ║\n"
     "║  o.plan_place()              — plan p_place/p4/p5 on its own   ║\n"
     "║  o.add_box_to_scene()        — manually add box to HPP scene   ║\n"
