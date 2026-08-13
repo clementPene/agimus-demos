@@ -7,8 +7,8 @@
 # ── Trajectory sampling ───────────────────────────────────────────────────────
 trajectory:
   dt: 0.01          # sampling period (s) — must match agimus_controller rate
-  time_scale: 1.3   # stretch HPP path time further so the arm settles with less overshoot while keeping the same final pose — lowered from 1.6 (2026-08-12) to cut wall-clock motion time under Gazebo's <1.0 real-time factor; revert toward 1.6 if p1/p2/p4 start overshooting/losing tracking
-  carry_time_scale: 1.15   # faster than time_scale so p3 does not drag in Gazebo, but not as fast as 1.0 — gives the controller more margin to track the carry motion (1.0 was seen to intermittently lose tracking). Lowered from 1.3 (2026-08-12); stay above 1.0, the known failure point
+  time_scale: 1.3   # stretch HPP path time further so the arm settles with less overshoot while keeping the same final pose; raise toward 1.6 if p1/p2/p4 start overshooting or losing tracking
+  carry_time_scale: 1.15   # faster than time_scale so p3 does not drag in Gazebo, but stays above 1.0 — at 1.0 the controller intermittently loses tracking on the carry motion
 
 # ── Configurable T-LESS object ───────────────────────────────────────────────
 # Shipped object assets: obj_01, obj_20, obj_21, obj_22, obj_23, obj_23,
@@ -45,13 +45,6 @@ tuck:
 # in transit — reached right after grasping and held through navigation,
 # before the arm moves on to hover above the drop-zone box for placement
 # (see box: below — that target is computed via IK, not hardcoded here).
-# Same as tuck.left_arm — the previous value [2.8, -2.12, 2.35, -2.20, -2.6,
-# 0.91, -0.26] put joints 2/3/4 within 8-13 degrees of their hard limits
-# (confirmed via the Pinocchio model's own lowerPositionLimit/
-# upperPositionLimit), which is the actual root cause of p3 never settling
-# in Gazebo — not a timing/buffer issue. tuck.left_arm reaches a different
-# end-effector point but has far better margins (31/110 degrees on joints
-# 2/3) and is already proven safe by tuck_arm().
 carry:
   arm_config: [2.8, -2.12, 2.35, -2.20, -2.6, 0.91, -0.26]
 
@@ -107,10 +100,3 @@ weights:
   w_collision:   0.0
   w_frame_trans: [1000.0, 1000.0, 1000.0]                               # tighten translational alignment so the gripper lands closer to the planned grasp pose
   w_frame_rot:   [60.0, 60.0, 60.0]                                  # keep wrist alignment firm without driving small orientation oscillations
-  # w_q:           [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
-  # w_qdot:        [0.01,  0.01,  0.01,  0.01,  0.01,  0.01,  0.01 ]
-  # w_qddot:       [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
-  # w_effort:      [0.01,   0.01,   0.01,   0.01,   0.01,   0.01,   0.01  ]
-  # w_collision:   0.0
-  # w_frame_trans: [10000.0, 10000.0, 10000.0]
-  # w_frame_rot:   [5.0, 5.0, 5.0]

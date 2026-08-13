@@ -310,9 +310,8 @@ ARM_SETTLE_TIMEOUT = 50.0           # s, max extra wait for /joint_states to con
 # oscillating right on that floor continuously, degrading the OCP's horizon
 # every cycle for big, fast motions like p3. Burst-publish this many
 # messages up front (no DT pacing) before switching to the normal paced
-# loop, so the buffer starts with real headroom instead of teetering on the
-# minimum — 100 matches agimus_controller_node's own "comfortable startup"
-# threshold (buffer_has_enough_data(2) == 2x horizon_size at node init).
+# loop, so the buffer starts at its minimum headroom (horizon_size) instead
+# of ramping up to it one message at a time.
 PUBLISH_BURST_COUNT = 50
 # /joint_states may be published with different QoS settings depending on
 # the source node, so we subscribe with all three and take whichever message
