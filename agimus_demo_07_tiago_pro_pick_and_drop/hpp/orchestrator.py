@@ -301,7 +301,7 @@ PATH_START_JOINT_WARN_RAD = 0.35
 # a redundant joint can settle into a different null-space posture than HPP
 # planned — per-joint error then stays large even once the end-effector
 # (what actually matters for approach/grasp) has arrived.
-ARM_SETTLE_EE_POS_TOLERANCE_MM = 15.0  # mm, max end-effector position error to consider the arm "arrived"
+ARM_SETTLE_EE_POS_TOLERANCE_MM = 50.0  # mm, max end-effector position error to consider the arm "arrived"
 ARM_SETTLE_EE_ROT_TOLERANCE_DEG = 5.0  # deg, max end-effector orientation error to consider the arm "arrived"
 ARM_SETTLE_TIMEOUT = 50.0           # s, max extra wait for /joint_states to confirm arrival
 # agimus_controller_node's trajectory buffer needs >= ocp.horizon_size (50)
@@ -1572,7 +1572,7 @@ class Orchestrator:
 
     def plan_pick(
         self,
-        max_attempts: int = 100,
+        max_attempts: int = 1000,
         approach_shortcut_passes: int = 1,
         approach_use_spline: bool = False,
         sync_with_robot: bool = True,
@@ -1730,7 +1730,7 @@ class Orchestrator:
             return None
         return q_retract
 
-    def _find_drop_config(self, qg, max_attempts: int = 100):
+    def _find_drop_config(self, qg, max_attempts: int = 1000):
         """
         Solve for an arm configuration that places the grasped object
         BOX_CLEARANCE above the drop-zone box's rim (BOX_POS + wall height,
@@ -1807,7 +1807,7 @@ class Orchestrator:
         )
         return None
 
-    def _find_predrop_config(self, q_drop, max_attempts: int = 100):
+    def _find_predrop_config(self, q_drop, max_attempts: int = 1000):
         """Find a valid pre-grasp config at the drop zone for the p4 release motion."""
         if self._transition_release is None:
             return None
@@ -2070,6 +2070,19 @@ class Orchestrator:
             node.create_subscription(JointState, "/joint_states", _cb, profile)
             for profile in JOINT_STATE_QOS_PROFILES
         ]
+
+    def _ensure_tf_buffer(self, node: Node):
+        """Cache one Buffer()/TransformListener pair on `node`, mirroring
+        _ensure_mpc_publisher/_ensure_joint_state_cache — a persistent
+        subscription pays TF discovery cost once instead of racing it
+        against the lookup timeout on every call."""
+        buffer = getattr(node, "_hpp_tf_buffer", None)
+        if buffer is None:
+            from tf2_ros import Buffer, TransformListener
+            buffer = Buffer()
+            TransformListener(buffer, node)
+            setattr(node, "_hpp_tf_buffer", buffer)
+        return buffer
 
     def _execution_node(self) -> Node:
         if self._ros_node is None:
@@ -2955,31 +2968,43 @@ class Orchestrator:
         source_frame: str,
         timeout: float,
     ) -> pin.SE3:
+        """Look up target_frame <- source_frame via TF. Uses the orchestrator's
+        persistent node/buffer (_execution_node/_ensure_tf_buffer) rather than a
+        throwaway node per call, so TF discovery only pays its cost once instead
+        of racing the timeout on every call — a fresh node's discovery can get
+        slower as the ROS graph grows over a session, which previously showed up
+        as intermittent "frame does not exist" failures after TF had resolved
+        fine earlier in the same session."""
         from rclpy.duration import Duration
         from rclpy.time import Time
-        from tf2_ros import Buffer, TransformListener
+
+        node = self._execution_node()
+        tf_buffer = self._ensure_tf_buffer(node)
 
         last_error = None
-        with self._borrow_ros_node("hpp_happypose_tf_lookup") as node:
-            tf_buffer = Buffer()
-            TransformListener(tf_buffer, node)
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                rclpy.spin_once(node, timeout_sec=0.1)
-                try:
-                    transform = tf_buffer.lookup_transform(
-                        target_frame,
-                        source_frame,
-                        Time(),
-                        timeout=Duration(seconds=0.1),
-                    )
-                    return self._pose_to_se3(transform.transform)
-                except Exception as exc:
-                    last_error = exc
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            rclpy.spin_once(node, timeout_sec=0.1)
+            try:
+                transform = tf_buffer.lookup_transform(
+                    target_frame,
+                    source_frame,
+                    Time(),
+                    timeout=Duration(seconds=0.1),
+                )
+                return self._pose_to_se3(transform.transform)
+            except Exception as exc:
+                last_error = exc
+
+        try:
+            known_frames = tf_buffer.all_frames_as_string().strip() or "(none)"
+        except Exception:
+            known_frames = "(unavailable)"
 
         raise RuntimeError(
             f"Could not transform HappyPose pose from '{source_frame}' to "
-            f"'{target_frame}' within {timeout}s: {last_error}"
+            f"'{target_frame}' within {timeout}s: {last_error}\n"
+            f"Frames known to TF at time of failure:\n{known_frames}"
         )
 
     def update_object_pose(self, t: list, q: list = None) -> None:
@@ -3299,7 +3324,7 @@ class Orchestrator:
 
     # ── Combined ──────────────────────────────────────────────────────────────
 
-    def plan_and_execute_full(self, max_attempts: int = 100) -> bool:
+    def plan_and_execute_full(self, max_attempts: int = 1000) -> bool:
         """Run a complete pick-and-drop cycle end to end: plan_pick(), then
         execute() (execute_pick() followed by execute_place() — navigate to
         the drop zone, add the box, plan_place(), run p_place/p4/p5,
