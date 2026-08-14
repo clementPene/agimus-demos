@@ -241,6 +241,7 @@ W_QDDOT     = np.array(_w["w_qddot"])
 W_EFFORT    = np.array(_w["w_effort"])
 W_COLLISION = _w["w_collision"]
 W_FRAME_TRANS = np.array(_w["w_frame_trans"])
+W_FRAME_TRANS_GRASP = np.array(_w["w_frame_trans_grasp"])
 W_FRAME_ROT   = np.array(_w["w_frame_rot"])
 
 GRIPPER_OPEN_POSITION = 0.07     # m, fingertip travel used as the HPP planning target
@@ -1975,7 +1976,7 @@ class Orchestrator:
             q_full[arm_idx:arm_idx+7] += dt * dq_arm
         return None
 
-    def _build_msg(self, q, dq, ddq, msg_id):
+    def _build_msg(self, q, dq, ddq, msg_id, w_frame_trans=W_FRAME_TRANS):
         """Build one MpcInput: joint-space targets/weights for the 7 active
         arm joints, plus a Cartesian end-effector target/weights (computed
         via forward kinematics) that the MPC controller blends in for
@@ -2003,7 +2004,7 @@ class Orchestrator:
         ee_input.pose.orientation.y = float(quat.y)
         ee_input.pose.orientation.z = float(quat.z)
         ee_input.pose.orientation.w = float(quat.w)
-        ee_input.w_pose = list(np.concatenate([W_FRAME_TRANS, W_FRAME_ROT]))
+        ee_input.w_pose = list(np.concatenate([w_frame_trans, W_FRAME_ROT]))
         msg.ee_inputs = [ee_input]
         return msg
 
@@ -2167,6 +2168,15 @@ class Orchestrator:
             return CARRY_TIME_SCALE
         return TIME_SCALE
 
+    def _frame_trans_weight_for(self, path) -> np.ndarray:
+        """The `w_frame_trans` _build_msg() should use for `path` — tighter
+        (W_FRAME_TRANS_GRASP) for p2 (pregrasp -> grasp close-in), the
+        default (W_FRAME_TRANS) for everything else. Mirrors
+        _time_scale_for."""
+        if path is self.p2:
+            return W_FRAME_TRANS_GRASP
+        return W_FRAME_TRANS
+
     def _build_messages(self, paths: list, n_hold: int = 200) -> list:
         """Sample each (path, label) pair into MpcInput messages, then
         append n_hold extra messages at the final position with zero
@@ -2176,11 +2186,13 @@ class Orchestrator:
         into instead."""
         msgs = []
         idx = self._next_msg_id
+        last_w_frame_trans = W_FRAME_TRANS
         for path, label in paths:
+            last_w_frame_trans = self._frame_trans_weight_for(path)
             q_arr, dq_arr, ddq_arr = self._sample_path(path, time_scale=self._time_scale_for(path))
             print(f"  {label}: {len(q_arr)} waypoints")
             for q, dq, ddq in zip(q_arr, dq_arr, ddq_arr):
-                msgs.append(self._build_msg(q, dq, ddq, idx))
+                msgs.append(self._build_msg(q, dq, ddq, idx, w_frame_trans=last_w_frame_trans))
                 idx += 1
         if not msgs:
             return []
@@ -2189,7 +2201,8 @@ class Orchestrator:
         ddq_zero = np.zeros(len(msgs[-1].qddot)).tolist()
         for _ in range(n_hold):
             msg = self._build_msg(
-                np.array(q_final), np.array(dq_zero), np.array(ddq_zero), idx
+                np.array(q_final), np.array(dq_zero), np.array(ddq_zero), idx,
+                w_frame_trans=last_w_frame_trans,
             )
             msgs.append(msg)
             idx += 1

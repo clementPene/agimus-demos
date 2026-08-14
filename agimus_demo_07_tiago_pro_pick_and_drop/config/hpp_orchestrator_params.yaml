@@ -98,5 +98,6 @@ weights:
   w_qddot:       [0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08]         # penalize sharp acceleration reversals that show up as vibration
   w_effort:      [0.006, 0.006, 0.006, 0.006, 0.006, 0.006, 0.006]  # limit corrective torque spikes while keeping the end-effector target precise
   w_collision:   0.0
-  w_frame_trans: [1000.0, 1000.0, 1000.0]                               # tighten translational alignment so the gripper lands closer to the planned grasp pose
+  w_frame_trans:       [1000.0, 1000.0, 1000.0]                      # tighten translational alignment so the gripper lands closer to the planned grasp pose (baseline, all phases except p2)
+  w_frame_trans_grasp: [3000.0, 3000.0, 3000.0]                      # tighter translational alignment during p2 (pregrasp -> grasp close-in), where precision into contact matters most
   w_frame_rot:   [60.0, 60.0, 60.0]                                  # keep wrist alignment firm without driving small orientation oscillations
