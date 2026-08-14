@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Hollow drop-zone container: a bottom plus 4 thin walls, NOT a solid
      box (a solid box would make it impossible for anything to ever be
-     placed inside it). Inner opening 0.15 x 0.15 m, wall height 0.08 m,
-     wall/bottom thickness 0.003 m. Pose is set entirely by the SE3 argument
+     placed inside it). Outer footprint 0.295 x 0.195 m, overall height
+     0.145 m, wall/bottom thickness 0.003 m (inner opening 0.289 x 0.189 m,
+     wall height 0.142 m). Pose is set entirely by the SE3 argument
      passed to urdf.loadModel() in orchestrator.py (this file only defines
      shape, relative to its own base_link at the container's bottom-outer
      surface, centered in x/y). -->
@@ -15,7 +16,7 @@
   <!-- Virtual root -->
   <link name="base_link"/>
 
-  <!-- Bottom: 0.156 x 0.156 x 0.003 m, centred at z = 0.0015 m -->
+  <!-- Bottom: 0.295 x 0.195 x 0.003 m, centred at z = 0.0015 m -->
   <joint name="box_bottom_joint" type="fixed">
     <parent link="base_link"/>
     <child link="box_bottom_link"/>
@@ -23,11 +24,11 @@
   </joint>
   <link name="box_bottom_link">
     <visual>
-      <geometry><box size="0.156 0.156 0.003"/></geometry>
+      <geometry><box size="0.295 0.195 0.003"/></geometry>
       <material name="box_grey"/>
     </visual>
     <collision>
-      <geometry><box size="0.156 0.156 0.003"/></geometry>
+      <geometry><box size="0.295 0.195 0.003"/></geometry>
     </collision>
     <inertial>
       <mass value="0.2"/>
@@ -35,21 +36,21 @@
     </inertial>
   </link>
 
-  <!-- Walls: 0.08 m tall, sit on top of the bottom (z = 0.003 to 0.083,
-       centred at z = 0.043), inner opening 0.15 x 0.15 m. -->
+  <!-- Walls: 0.142 m tall, sit on top of the bottom (z = 0.003 to 0.145,
+       centred at z = 0.074), inner opening 0.289 x 0.189 m. -->
 
   <joint name="box_wall_front_joint" type="fixed">
     <parent link="base_link"/>
     <child link="box_wall_front_link"/>
-    <origin xyz="0.0765 0 0.043" rpy="0 0 0"/>
+    <origin xyz="0.146 0 0.074" rpy="0 0 0"/>
   </joint>
   <link name="box_wall_front_link">
     <visual>
-      <geometry><box size="0.003 0.156 0.08"/></geometry>
+      <geometry><box size="0.003 0.195 0.142"/></geometry>
       <material name="box_grey"/>
     </visual>
     <collision>
-      <geometry><box size="0.003 0.156 0.08"/></geometry>
+      <geometry><box size="0.003 0.195 0.142"/></geometry>
     </collision>
     <inertial>
       <mass value="0.1"/>
@@ -60,15 +61,15 @@
   <joint name="box_wall_back_joint" type="fixed">
     <parent link="base_link"/>
     <child link="box_wall_back_link"/>
-    <origin xyz="-0.0765 0 0.043" rpy="0 0 0"/>
+    <origin xyz="-0.146 0 0.074" rpy="0 0 0"/>
   </joint>
   <link name="box_wall_back_link">
     <visual>
-      <geometry><box size="0.003 0.156 0.08"/></geometry>
+      <geometry><box size="0.003 0.195 0.142"/></geometry>
       <material name="box_grey"/>
     </visual>
     <collision>
-      <geometry><box size="0.003 0.156 0.08"/></geometry>
+      <geometry><box size="0.003 0.195 0.142"/></geometry>
     </collision>
     <inertial>
       <mass value="0.1"/>
@@ -79,15 +80,15 @@
   <joint name="box_wall_left_joint" type="fixed">
     <parent link="base_link"/>
     <child link="box_wall_left_link"/>
-    <origin xyz="0 0.0765 0.043" rpy="0 0 0"/>
+    <origin xyz="0 0.096 0.074" rpy="0 0 0"/>
   </joint>
   <link name="box_wall_left_link">
     <visual>
-      <geometry><box size="0.156 0.003 0.08"/></geometry>
+      <geometry><box size="0.295 0.003 0.142"/></geometry>
       <material name="box_grey"/>
     </visual>
     <collision>
-      <geometry><box size="0.156 0.003 0.08"/></geometry>
+      <geometry><box size="0.295 0.003 0.142"/></geometry>
     </collision>
     <inertial>
       <mass value="0.1"/>
@@ -98,15 +99,15 @@
   <joint name="box_wall_right_joint" type="fixed">
     <parent link="base_link"/>
     <child link="box_wall_right_link"/>
-    <origin xyz="0 -0.0765 0.043" rpy="0 0 0"/>
+    <origin xyz="0 -0.096 0.074" rpy="0 0 0"/>
   </joint>
   <link name="box_wall_right_link">
     <visual>
-      <geometry><box size="0.156 0.003 0.08"/></geometry>
+      <geometry><box size="0.295 0.003 0.142"/></geometry>
       <material name="box_grey"/>
     </visual>
     <collision>
-      <geometry><box size="0.156 0.003 0.08"/></geometry>
+      <geometry><box size="0.295 0.003 0.142"/></geometry>
     </collision>
     <inertial>
       <mass value="0.1"/>

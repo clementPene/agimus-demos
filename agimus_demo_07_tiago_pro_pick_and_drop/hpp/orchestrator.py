@@ -214,7 +214,7 @@ _box_cfg = _cfg["box"]
 BOX_POS  = np.array([_box_cfg["x"], _box_cfg["y"], _box_cfg["z"]])
 BOX_CLEARANCE = _box_cfg.get("clearance", 0.05)
 # Bottom thickness + wall height from box.urdf -- keep in sync there.
-BOX_WALL_TOP_OFFSET = 0.003 + 0.08
+BOX_WALL_TOP_OFFSET = 0.003 + 0.142
 
 LEFT_ARM_TUCK  = _cfg["tuck"]["left_arm"]
 RIGHT_ARM_TUCK = _cfg["tuck"]["right_arm"]

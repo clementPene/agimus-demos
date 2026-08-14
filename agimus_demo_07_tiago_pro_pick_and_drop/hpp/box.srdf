@@ -1,5 +1,5 @@
 <!-- Drop-zone box contact surface for HPP.
-     box_bottom_link is a 0.156 x 0.156 x 0.003 m box, centred at z = 0.0015
+     box_bottom_link is a 0.295 x 0.195 x 0.003 m box, centred at z = 0.0015
      in base_link frame (see urdf/box.urdf).
      Top face of the bottom = 0.0015 + 0.0015 = 0.003 m.
      Contact points are expressed in the box_bottom_link frame (+z = up). -->
@@ -8,10 +8,10 @@
     <link name="box_bottom_link"/>
     <!-- Four corners of the bottom's top face in box_bottom_link frame -->
     <point>
-       0.078 -0.078  0.0015
-       0.078  0.078  0.0015
-      -0.078  0.078  0.0015
-      -0.078 -0.078  0.0015
+       0.1475 -0.0975  0.0015
+       0.1475  0.0975  0.0015
+      -0.1475  0.0975  0.0015
+      -0.1475 -0.0975  0.0015
     </point>
     <shape>4 0 1 2 3</shape>
   </contact>

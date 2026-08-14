@@ -84,12 +84,12 @@ nav:
 # spot (object.x/y is the pick location); fill in the real container
 # position once known.
 box:
-  x: 0.55
+  x: 0.8
   y: 0.3
   z: 0.745
   # How far above the box's rim the grasped object should end up when
   # p_place completes.
-  clearance: 0.05
+  clearance: 0.10
 
 # ── MPC weights ───────────────────────────────────────────────────────────────
 weights:
