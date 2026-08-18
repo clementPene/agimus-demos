@@ -37,7 +37,7 @@ object:
 
 # ── Arm tuck configurations (same as demo_07_fixed) ──────────────────────────
 tuck:
-  left_arm:  [2.8, -1.81, -0.56, -2.20, -2.6, 0.91, -0.26]
+  left_arm:  [1.87, -2.17, -1.37, -2.18, -2.6, 1.52, -0.09]
   right_arm: [-2.8, -1.81, 0.56, -2.20, 2.6, 0.91, 0.26]
 
 # ── Carry-position arm configuration ─────────────────────────────────────────
@@ -84,12 +84,12 @@ nav:
 # spot (object.x/y is the pick location); fill in the real container
 # position once known.
 box:
-  x: 0.8
+  x: 0.85
   y: 0.3
   z: 0.745
   # How far above the box's rim the grasped object should end up when
   # p_place completes.
-  clearance: 0.10
+  clearance: 0.025
 
 # ── MPC weights ───────────────────────────────────────────────────────────────
 weights:

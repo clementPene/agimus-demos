@@ -39,7 +39,8 @@ Phase labels:
                       been added to the scene (add_box_to_scene). The target arm
                       config is not hardcoded — it's solved via IK (_find_drop_config)
                       so the object ends up BOX_CLEARANCE above box.{x,y,z}'s rim,
-                      keeping its grasped orientation. Moving the box in the config
+                      with the gripper pointing straight down (only yaw about that
+                      down axis is left free). Moving the box in the config
                       moves where p_place ends up; no manual arm-config retuning needed.
     p4 — release   : arm retreats from drop zone (planned from q_drop when carry exists)
     p5 — return    : arm moves back to the transport pose (CARRY_ARM_CFG), empty-handed,
@@ -215,6 +216,12 @@ BOX_POS  = np.array([_box_cfg["x"], _box_cfg["y"], _box_cfg["z"]])
 BOX_CLEARANCE = _box_cfg.get("clearance", 0.05)
 # Bottom thickness + wall height from box.urdf -- keep in sync there.
 BOX_WALL_TOP_OFFSET = 0.003 + 0.142
+
+# EE frame's (arm_left_tool_link) local +Z is the gripper's approach axis (see
+# tiago_pro.srdf's gripper offset: pure +Z translation, identity rotation, to
+# the grasp frame). Rx(pi) maps that local +Z to world -Z, i.e. gripper
+# looking straight down.
+GRIPPER_DOWN_ROTATION = np.diag([1.0, -1.0, -1.0])
 
 LEFT_ARM_TUCK  = _cfg["tuck"]["left_arm"]
 RIGHT_ARM_TUCK = _cfg["tuck"]["right_arm"]
@@ -913,7 +920,7 @@ class Orchestrator:
         # add_box_to_scene — it's absent during p1/p2/p2b/p3), gets a real
         # margin here too, applying to every transition including "carry",
         # which by the time the box exists is only ever used again for
-        # p_place/p4/p5.
+        # p_place/p5.
         margin_entities = ["tiago_pro", self._obj_name, "table"]
         if self._box_loaded:
             margin_entities.append("box")
@@ -965,7 +972,7 @@ class Orchestrator:
             attr: getattr(self, attr).name()
             for attr in (
                 "_transition_approach", "_transition_grasp", "_transition_carry",
-                "_transition_release", "_transition_return",
+                "_transition_return",
             )
             if getattr(self, attr, None) is not None
         }
@@ -984,7 +991,7 @@ class Orchestrator:
                 print(f"  WARNING: could not re-resolve {attr} ('{name}') after rebuilding the graph: {e}")
 
     def _build_grasp_candidates(self, graph):
-        """Build one (approach, grasp, carry, release) transition quadruple
+        """Build one (approach, grasp, carry, return) transition quadruple
         per object handle. Vision can't tell us which handle is actually
         reachable (e.g. the object detected flipped ~180 deg), so plan_pick()
         tries each candidate and picks whichever one actually plans — see
@@ -997,19 +1004,20 @@ class Orchestrator:
         for handle in self._handle_names:
             transition_approach = graph.getTransition(f"{gripper} > {handle} | f_01")
             transition_grasp = graph.getTransition(f"{gripper} > {handle} | f_12")
-            # Loop edge at grasped state — used for the carry phase.
+            # Loop edge at grasped state — used for the carry phase, and for
+            # placing/returning from the drop zone (see _plan_place_impl):
+            # the object is already released (gripper open) by the time the
+            # return-to-carry-pose leg actually executes, so modeling it as
+            # still "grasped" during that leg's planning is the same
+            # harmless fiction p_place/p3 already rely on.
             carry_edge = self._find_carry_edge(graph, transition_grasp)
             self._grasp_candidates.append({
                 "name": handle,
                 "approach": transition_approach,
                 "grasp": transition_grasp,
                 "carry": carry_edge,
-                # Reverse edge from grasped back to pre-grasp — used for
-                # release at drop zone.
-                "release": self._find_release_edge(graph, transition_grasp),
-                # Pre-grasp → free edge (reverse of approach) — p4/release
-                # lands in the pre-grasp state, not free; this brings the arm
-                # into free before projecting it onto the carry pose.
+                # Free-state self-loop (reverse of approach) — used only by
+                # tuck_arm(), not by placing.
                 "return": self._find_return_edge(graph, transition_approach),
             })
 
@@ -1017,7 +1025,6 @@ class Orchestrator:
         self._transition_approach = default["approach"]
         self._transition_grasp    = default["grasp"]
         self._transition_carry    = default["carry"]
-        self._transition_release  = default["release"]
         self._transition_return   = default["return"]
 
     def _locked_joints(self, robot, model):
@@ -1099,35 +1106,11 @@ class Orchestrator:
         return None
 
     @staticmethod
-    def _find_release_edge(graph, grasp_transition):
-        """Return the grasped → pre-grasp release transition (reverse of grasp)."""
-        try:
-            pre_grasp_state, grasped_state = graph.getNodesConnectedByTransition(
-                grasp_transition
-            )
-        except Exception:
-            print("  WARNING: release edge not found — p4 will use reversed p2.")
-            return None
-
-        edge = Orchestrator._find_transition_between(
-            graph, grasped_state, pre_grasp_state, "Release"
-        )
-        if edge is not None:
-            return edge
-
-        print("  WARNING: release edge not found — p4 will use reversed p2.")
-        return None
-
-    @staticmethod
     def _find_return_edge(graph, approach_transition):
         """Return the self-loop transition attached to the free state
-        (approach_transition's source). p4/release lands the arm in the
-        pre-grasp state, which is strictly more constrained than free, so
-        q_predrop is already a valid free-state configuration too; this
-        self-loop is what actually lets generateTargetConfig move it to a
-        different configuration (the carry pose) — unlike the pre-grasp →
-        free relaxation edge, which just hands q_predrop back unchanged
-        since it already trivially satisfies free's (empty) constraints."""
+        (approach_transition's source) — used by tuck_arm() to reach a
+        tucked posture from an arbitrary current config, independent of
+        any grasp/place cycle."""
         try:
             free_state, _ = graph.getNodesConnectedByTransition(approach_transition)
         except Exception:
@@ -1445,22 +1428,24 @@ class Orchestrator:
         self._set_box_loaded(False)
 
     def plan_place(self) -> bool:
-        """Plan p_place (transport pose to drop zone), p4 (release/
-        retreat) and p5 (return to carry pose, empty-handed, before
-        navigating back to the initial point), against the current grasp
-        (self.qg, self.q_carry) once the drop-zone box has been added to
-        the scene. Called from execute_place() right after
-        navigate_to_drop_zone_and_add_box() succeeds (also calls
-        add_box_to_scene() itself — idempotent — so this can be called
-        on its own too). Returns False only on a hard
-        failure (no reachable drop config at all) — p4/p5 degrade
-        gracefully to None on their own failures without failing the
-        whole call, same as before."""
+        """Plan p_place (transport pose to drop zone) and p5 (return to
+        carry pose, empty-handed, before navigating back to the initial
+        point), against the current grasp (self.qg, self.q_carry) once the
+        drop-zone box has been added to the scene. There's no separate p4
+        retract/retreat leg — the object is simply released above the box
+        (see execute_place()) and the arm goes straight back to
+        self.q_carry via the same carry self-loop used for p_place/p3, no
+        pre-grasp waypoint detour needed. Called from execute_place()
+        right after navigate_to_drop_zone_and_add_box() succeeds (also
+        calls add_box_to_scene() itself — idempotent — so this can be
+        called on its own too). Returns False only on a hard failure (no
+        reachable drop config at all) — p5 degrades gracefully to None on
+        its own failure without failing the whole call."""
         result = self._plan_place_impl()
         # Prefetch regardless of exactly how far _plan_place_impl got —
-        # whichever of p_place/p4/p5 it managed to set, sample it now
-        # rather than stalling execute_place() between phases.
-        self._prefetch_sampled_paths(self.p_place, self.p4, self.p5)
+        # whichever of p_place/p5 it managed to set, sample it now rather
+        # than stalling execute_place() between phases.
+        self._prefetch_sampled_paths(self.p_place, self.p5)
         return result
 
     def _plan_place_impl(self) -> bool:
@@ -1475,6 +1460,27 @@ class Orchestrator:
         shortcut = GraphRandomShortcut(self.problem)
         spline_opt = SplineGradientBased_bezier3(self.problem)
         q_goal = np.zeros((1, self.robot.configSize()), order='F')
+
+        # self.q_carry was projected onto the carry manifold back in
+        # plan_pick(), before the box was in the scene. add_box_to_scene()
+        # (just above) may have since called sync_from_robot(), which
+        # rebuilds the graph with its LockedJoint targets (torso/head/
+        # other-arm) rebaked from the robot's current state — leaving
+        # self.q_carry stale on those DOFs (even though the grasp/active-arm
+        # part is unaffected) and liable to fail the new graph's carry-edge
+        # constraints. Re-project it before using it as p_place's start.
+        generated, valid, q_carry, err = self._generate_valid_config(
+            self._transition_carry, self.qg, self.q_carry
+        )
+        if not generated or not valid:
+            report = self._last_invalid_config_report
+            detail = f" — {report}" if report is not None else ""
+            print(
+                f"  Failed to re-project carry config onto the post-box carry "
+                f"manifold (err={err:.2e}){detail} — skipping place phase."
+            )
+            return False
+        self.q_carry = q_carry
 
         q_drop = self._find_drop_config(self.qg)
         if q_drop is None:
@@ -1491,45 +1497,21 @@ class Orchestrator:
             print(f"  p_place planning failed: {e}.  Skipping place phase.")
             return False
 
-        q_predrop = self._find_predrop_config(q_drop)
-        if q_predrop is None:
-            print("  No pre-drop config — skipping retreat at drop zone.")
-            self.q_predrop = None
-            return True
-
-        try:
-            p4 = self._plan_transition_path(
-                planner, q_goal, self._transition_release,
-                q_drop, q_predrop, "p4 (release at drop zone)"
-            )
-            self.p4 = self._optimize_path(p4, "p4", shortcut, spline_opt)
-            self.q_predrop = q_predrop
-        except Exception as ep4:
-            print(f"  p4 planning failed: {ep4}.  Skipping retreat at drop zone.")
-            self.q_predrop = None
-            return True
-
-        if self._transition_return is None:
-            print("  No return edge — skipping return to carry pose.")
-            self.q_return = None
-            return True
-
-        q_return = self._find_return_config(q_predrop)
-        if q_return is None:
-            print("  No return config — skipping return to carry pose.")
-            self.q_return = None
-            return True
-
+        # No separate retract (p4): the gripper has already opened by the
+        # time this leg executes (see execute_place()), so there's nothing
+        # left to retreat from — just get the arm back to the transport
+        # pose. self.q_carry (already validated above as p_place's own
+        # start point) is exactly that pose, still reachable via the same
+        # carry self-loop used for p_place/p3 — no pre-grasp waypoint
+        # detour needed.
         try:
             p5 = self._plan_transition_path(
-                planner, q_goal, self._transition_return,
-                q_predrop, q_return, "p5 (return to carry pose)"
+                planner, q_goal, self._transition_carry,
+                q_drop, self.q_carry, "p5 (return to carry pose)"
             )
             self.p5 = self._optimize_path(p5, "p5", shortcut, spline_opt)
-            self.q_return = q_return
-        except Exception as ep5:
-            print(f"  p5 planning failed: {ep5}.  Skipping return to carry pose.")
-            self.q_return = None
+        except Exception as e:
+            print(f"  p5 planning failed: {e}.  Skipping return to carry pose.")
 
         return True
 
@@ -1566,7 +1548,6 @@ class Orchestrator:
         self._transition_approach = chosen["approach"]
         self._transition_grasp    = chosen["grasp"]
         self._transition_carry    = chosen["carry"]
-        self._transition_release  = chosen["release"]
         self._transition_return   = chosen["return"]
         self._seed_candidates     = chosen["_valid_samples"]
 
@@ -1734,23 +1715,32 @@ class Orchestrator:
         """
         Solve for an arm configuration that places the grasped object
         BOX_CLEARANCE above the drop-zone box's rim (BOX_POS + wall height,
-        from BOX_WALL_TOP_OFFSET), keeping the object's grasped orientation
-        unchanged. The target depends entirely on the box's configured
-        pose, not on any hardcoded arm configuration — move the box in the
-        config and p_place follows it, no manual retuning needed.
+        from BOX_WALL_TOP_OFFSET), with the gripper pointing straight down
+        (GRIPPER_DOWN_ROTATION, free_yaw IK, see _solve_ee_ik) — only yaw
+        about that down axis, and the object's own resulting orientation,
+        are left free, since the object is just being dropped into the box
+        and doesn't need to land in any particular orientation itself. The
+        target depends entirely on the box's configured pose, not on any
+        hardcoded arm configuration — move the box in the config and
+        p_place follows it, no manual retuning needed.
 
         The object is rigidly attached to the gripper once grasped, so its
         pose relative to the tool frame (the "grasp offset") is fixed for a
         given handle; composing the desired object target with the inverse
-        of that offset gives the tool-frame IK target (_solve_ee_ik). A
-        7-DOF arm reaching a 6-DOF target has a 1-parameter family of
-        solutions, and not every member of that family is collision-free
-        (e.g. against the box itself) or within joint limits — HPP's own
-        pathValidation was observed NOT to catch out-of-bounds joint values
-        here, so bounds are checked explicitly. Try q_carry's own arm
-        config first (nearest already-known-valid pose), then qg's, then
-        random arm configs within joint limits, validating each against
-        _transition_carry until one succeeds.
+        of that offset gives the tool-frame IK target (_solve_ee_ik). The
+        object target's rotation is chosen as GRIPPER_DOWN_ROTATION @
+        grasp_offset.rotation specifically so that composing it with
+        grasp_offset.inverse() yields a tool_target whose rotation is
+        exactly GRIPPER_DOWN_ROTATION — free_yaw IK then only needs to
+        enforce position + tilt, not the object's rotation itself. Leaving
+        yaw (and the object's resulting orientation) free still gives a
+        2-parameter solution family, and not every member of that family
+        is collision-free (e.g. against the box itself) or within joint
+        limits — HPP's own pathValidation was observed NOT to catch
+        out-of-bounds joint values here, so bounds are checked explicitly.
+        Try q_carry's own arm config first (nearest already-known-valid
+        pose), then qg's, then random arm configs within joint limits,
+        validating each against _transition_carry until one succeeds.
 
         Called from plan_place(), after add_box_to_scene() has
         rebuilt the graph with the box present, so _transition_carry's own
@@ -1769,8 +1759,8 @@ class Orchestrator:
         obj_target_pos = BOX_POS + np.array(
             [0, 0, BOX_WALL_TOP_OFFSET + BOX_CLEARANCE]
         )
-        obj_target = pin.SE3(T_obj_g.rotation, obj_target_pos)
-        tool_target = obj_target * grasp_offset.inverse()
+        obj_target = pin.SE3(GRIPPER_DOWN_ROTATION @ grasp_offset.rotation, obj_target_pos)
+        tool_target = obj_target * grasp_offset.inverse()  # tool_target.rotation == GRIPPER_DOWN_ROTATION
 
         arm_idx = self._active_arm_idx
         lower = self.model.lowerPositionLimit[arm_idx:arm_idx+7]
@@ -1787,7 +1777,7 @@ class Orchestrator:
         for seed_arm in seed_arms():
             q_seed = np.array(qg).copy()
             q_seed[arm_idx:arm_idx+7] = seed_arm
-            q_ik = self._solve_ee_ik(tool_target, q_seed)
+            q_ik = self._solve_ee_ik(tool_target, q_seed, free_yaw=True)
             if q_ik is None:
                 continue
             arm_sol = q_ik[arm_idx:arm_idx+7]
@@ -1806,77 +1796,6 @@ class Orchestrator:
             "attempts — skipping place phase."
         )
         return None
-
-    def _find_predrop_config(self, q_drop, max_attempts: int = 1000):
-        """Find a valid pre-grasp config at the drop zone for the p4 release motion."""
-        if self._transition_release is None:
-            return None
-
-        release_validator = self._transition_release.pathValidation()
-
-        # First try the same deterministic projection pattern used for grasp:
-        # project q_drop through the reverse edge onto the pre-grasp manifold.
-        deterministic_seeds = [np.array(q_drop).copy()]
-        if self.qpg is not None:
-            q_seed = np.array(q_drop).copy()
-            arm_idx = self._active_arm_idx
-            q_seed[arm_idx:arm_idx+7] = np.array(self.qpg)[arm_idx:arm_idx+7]
-            deterministic_seeds.append(q_seed)
-
-        for idx, q_seed in enumerate(deterministic_seeds, start=1):
-            generated, valid, q_cand, err = self._generate_valid_config(
-                self._transition_release, q_drop, q_seed, release_validator
-            )
-            if not generated:
-                continue
-            if valid:
-                print(
-                    f"  q_predrop found from deterministic seed {idx}, err={err:.2e}"
-                )
-                return q_cand
-
-        shooter = self.problem.configurationShooter()
-        for attempt in range(max_attempts):
-            q = shooter.shoot()
-            generated, valid, q_cand, err = self._generate_valid_config(
-                self._transition_release, q_drop, q, release_validator
-            )
-            if not generated:
-                continue
-            if valid:
-                print(f"  q_predrop found at attempt {attempt + 1}, err={err:.2e}")
-                return q_cand
-        print(f"  WARNING: no valid pre-drop config found in {max_attempts} attempts.")
-        return None
-
-    def _find_return_config(self, q_predrop):
-        """
-        Project CARRY_ARM_CFG onto the free manifold, reachable from
-        q_predrop (the pre-grasp state p4/release lands in) via the
-        pre-grasp → free edge — after releasing the object, bring the arm
-        back to the same transport pose it held during carry, so the base
-        navigates back to the initial point with the arm in a known, safe
-        posture instead of wherever p4/release left it.
-        """
-        q_seed = np.array(q_predrop).copy()
-        arm_idx = self._active_arm_idx
-        q_seed[arm_idx:arm_idx+7] = CARRY_ARM_CFG
-
-        if self._transition_return is None:
-            return q_seed
-
-        generated, valid, q_return, err = self._generate_valid_config(
-            self._transition_return, q_predrop, q_seed
-        )
-        if not generated:
-            print(
-                f"  Failed to project return config onto free manifold (err={err:.2e}) — skipping p5."
-            )
-            return None
-        if not valid:
-            print("  Projected return config is not valid — skipping p5.")
-            return None
-        return q_return
 
     # ── Path sampling ─────────────────────────────────────────────────────────
 
@@ -1946,7 +1865,7 @@ class Orchestrator:
     def _solve_ee_ik(
         self, target: pin.SE3, q_full_seed: np.ndarray,
         max_iters: int = 300, dt: float = 0.3, damp: float = 1e-6,
-        tol: float = 1e-5,
+        tol: float = 1e-5, position_only: bool = False, free_yaw: bool = False,
     ):
         """Damped-least-squares IK for the 7 active-arm joints, moving only
         the EE frame (torso/base/other-arm/etc. held fixed at q_full_seed's
@@ -1956,13 +1875,26 @@ class Orchestrator:
         failures. 7 DOF into a 6D target is redundant (a 1-parameter family
         of solutions), so different seeds generally converge to different
         joint configs for the same target pose — try several and validate
-        each, don't rely on a single seed."""
+        each, don't rely on a single seed. position_only=True ignores
+        target's orientation entirely (only position error drives
+        convergence), widening that family to 4 parameters. free_yaw=True
+        is a middle ground: `err` (from pin.log6(target.actInv(T_cur))) is
+        the rotation error expressed in target's own local axes, so zeroing
+        only its local-Z component (err[5]) enforces position + tilt
+        (aligning local Z with target's local Z) while leaving rotation
+        about that axis free — used for placement, where the gripper must
+        point straight down (target's local Z = world down) but the yaw
+        about that down axis doesn't matter."""
         q_full = np.array(q_full_seed).copy()
         arm_idx = self._active_arm_idx
         arm_idx_v = self._active_arm_idx_v
         for _ in range(max_iters):
             T_cur = self._fk_ee_at(q_full)
             err = pin.log6(target.actInv(T_cur)).vector
+            if position_only:
+                err[3:] = 0.0
+            elif free_yaw:
+                err[5] = 0.0
             if np.linalg.norm(err) < tol:
                 return q_full
             J = pin.computeFrameJacobian(
@@ -2914,6 +2846,24 @@ class Orchestrator:
     def _se3_from_translation_quaternion(cls, t, q) -> pin.SE3:
         return pin.SE3(cls._rotation_from_xyzw(q), np.asarray(t, dtype=float))
 
+    @staticmethod
+    def _flatten_orientation_to_table(q: list) -> list:
+        """Keep only yaw (rotation about world Z) from a detected orientation,
+        discarding roll/pitch. The object always rests flat on the table in
+        this demo, so any roll/pitch in a HappyPose estimate is estimation
+        noise — T-LESS parts are symmetric/textureless and prone to ~180 deg
+        orientation flips that HappyPose can't distinguish from the true pose,
+        but which make the handle unreachable for grasping."""
+        rot = Orchestrator._rotation_from_xyzw(q)
+        yaw = np.arctan2(rot[1, 0], rot[0, 0])
+        flat_rot = np.array([
+            [np.cos(yaw), -np.sin(yaw), 0.0],
+            [np.sin(yaw),  np.cos(yaw), 0.0],
+            [0.0,          0.0,         1.0],
+        ])
+        flat_quat = pin.Quaternion(flat_rot)
+        return [flat_quat.x, flat_quat.y, flat_quat.z, flat_quat.w]
+
     @classmethod
     def _pose_to_se3(cls, pose) -> pin.SE3:
         """Convert common HappyPose/ROS/numpy pose containers to pin.SE3."""
@@ -3185,10 +3135,19 @@ class Orchestrator:
 
         base_T_object = base_T_camera * camera_T_object
         quat = pin.Quaternion(base_T_object.rotation)
-        q = [quat.x, quat.y, quat.z, quat.w]
+        # abs() because the object may legitimately rest either right-side-up
+        # or flipped (rot[2,2] near +1 or -1 respectively) — tilt is the
+        # deviation from EITHER flat state, not specifically from "right side up".
+        tilt_deg = np.degrees(np.arccos(np.clip(abs(base_T_object.rotation[2, 2]), -1.0, 1.0)))
+        if tilt_deg > 1.0:
+            print(
+                f"  Object orientation flattened: {tilt_deg:.1f}° of roll/pitch "
+                "discarded (yaw kept)."
+            )
+        q = self._flatten_orientation_to_table([quat.x, quat.y, quat.z, quat.w])
         t = self._resolve_table_collision(base_T_object.translation, q)
         self.update_object_pose(t, q)
-        base_T_object = pin.SE3(base_T_object.rotation, np.array(t))
+        base_T_object = pin.SE3(self._rotation_from_xyzw(q), np.array(t))
         return base_T_object
 
     # ── Pose comparison ───────────────────────────────────────────────────────
