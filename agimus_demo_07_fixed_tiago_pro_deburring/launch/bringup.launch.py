@@ -119,6 +119,7 @@ def launch_setup(
     )
 
     correction = LaunchConfiguration("correction")
+    use_force_feedback = LaunchConfiguration("use_force_feedback")
 
     agimus_controller_node = Node(
         package="agimus_controller_ros",
@@ -138,6 +139,16 @@ def launch_setup(
                         "'mpc_input_corrected' if '",
                         correction,
                         "' != 'none' else 'mpc_input'",
+                    ]
+                ),
+            ),
+            (
+                "sensor",
+                PythonExpression(
+                    [
+                        "'sensor_with_force' if '",
+                        use_force_feedback,
+                        "' == 'true' else 'sensor'",
                     ]
                 ),
             ),
@@ -163,6 +174,17 @@ def launch_setup(
         ],
         output="screen",
         condition=IfCondition(PythonExpression(["'", correction, "' == 'mocap'"])),
+    )
+
+    force_sensor_filter_node = ExecuteProcess(
+        cmd=[
+            "python3",
+            PathJoinSubstitution([_scripts_dir, "force_sensor_filter.py"]),
+        ],
+        output="screen",
+        condition=IfCondition(
+            PythonExpression(["'", use_force_feedback, "' == 'true'"])
+        ),
     )
 
     spawn_pylone_node = Node(
@@ -237,6 +259,7 @@ def launch_setup(
         mpc_debugger,
         mocap_ee_publisher_node,
         mocap_mpc_corrector_node,
+        force_sensor_filter_node,
         RegisterEventHandler(
             event_handler=OnProcessExit(
                 target_action=wait_for_non_zero_joints_node,
@@ -272,6 +295,19 @@ def generate_launch_description():
                 default_value="false",
                 choices=["true", "false"],
                 description="Launch the HPP orchestrator shell in xterm.",
+            ),
+            DeclareLaunchArgument(
+                "use_force_feedback",
+                default_value="false",
+                choices=["true", "false"],
+                description=(
+                    "Launch force_sensor_filter.py (right arm F/T sensor -> "
+                    "contact detection) and remap agimus_controller_node's "
+                    "'sensor' input to its 'sensor_with_force' output. "
+                    "Safe to enable even with OCPCrocoGeneric: the extra "
+                    "force on x0 is simply ignored until the OCP switches "
+                    "to OCPCrocoForceFeedbackGeneric."
+                ),
             ),
         ]
         + generate_default_tiago_pro_args()
