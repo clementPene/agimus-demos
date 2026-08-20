@@ -3,9 +3,30 @@
 # Task-space priority: frame tracking dominates, state_reg is a first guess only.
 
 running_model:
-  class: IntegratedActionModelEuler
+  class: IAMSoftContactAugmented
   differential:
-    class: DifferentialActionModelFreeFwdDynamics
+    class: DAMSoftContactAugmentedFwdDynamics
+    # Soft contact model — see agimus_demo_07_deburring/config/metal/ocp_definition_file.yaml
+    # (Franka reference). Kp/Kv are placeholder starting points copied from the
+    # Franka config (contact stiffness/damping, not derived from our F/T
+    # calibration — that calibrated mass/CoM for gravity comp, a different
+    # physical quantity — Kp/Kv need real contact tuning on the robot).
+    Kp: [6000, 6000, 6000]
+    Kv: [100, 100, 100]
+    # Must match force_sensor_filter.py's contact_name / agimus_controller.py's
+    # _FORCE_CONTACT_NAME (project_demo07_force_feedback_scoping memory).
+    frame_id: wrist_right_ft_sensor_link
+    # Contact point = tool tip, computed via FK from the real URDF (2026-08-20):
+    # wrist_right_ft_sensor_link -> gripper_right_tool_holder = 0.147928m (z,
+    # identity rotation) + 0.04m tool length (Ø40x40mm pal-atc deburring bit).
+    # NOT the same as the calibrated com_xyz (mass-weighted CoM, dominated by
+    # the pal-atc coupler close to the sensor) — this is the geometric contact
+    # point at the far end of the tool.
+    oPc: [0.0, 0.0, 0.187928]
+    with_gravity_torque_reg: true
+    enabled_directions: [true, true, true]
+    ref: LOCAL_WORLD_ALIGNED
+    cost_ref: LOCAL_WORLD_ALIGNED
     costs:
     - name: state_reg
       update: true
@@ -51,9 +72,17 @@ running_model:
           frame_id: gripper_right_tool_holder
 
 terminal_model:
-  class: IntegratedActionModelEuler
+  class: IAMSoftContactAugmented
   differential:
-    class: DifferentialActionModelFreeFwdDynamics
+    class: DAMSoftContactAugmentedFwdDynamics
+    Kp: [6000, 6000, 6000]
+    Kv: [100, 100, 100]
+    frame_id: wrist_right_ft_sensor_link
+    oPc: [0.0, 0.0, 0.187928]
+    with_gravity_torque_reg: false
+    enabled_directions: [true, true, true]
+    ref: LOCAL_WORLD_ALIGNED
+    cost_ref: LOCAL_WORLD_ALIGNED
     costs:
     - name: state_reg
       update: true
