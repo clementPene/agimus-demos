@@ -64,3 +64,39 @@ repositories:
     type: git
     url: https://github.com/pal-robotics/launch_pal.git
     version: 0.21.1
+
+  # ros2_control stack pinned to match pal-alum-* versions running on tiago-pro-25c
+  # (PAL backports a newer ros2_control onto their Humble-based "alum" distro;
+  # the apt ros-humble-* packages are older and cause ABI mismatches / garbled
+  # `ros2 control list_controllers` output when talking to the robot).
+  # Check the robot's actual versions with:
+  #   ssh pal@tiago-pro-25c "dpkg -l | grep -iE 'pal-alum-(controller-manager|ros2-controllers|realtime-tools|control-toolbox|control-msgs|kinematics-interface) '"
+  vcs_tiago_pro/ros2_control:
+    type: git
+    url: https://github.com/ros-controls/ros2_control.git
+    version: 4.46.0
+
+  vcs_tiago_pro/ros2_controllers:
+    type: git
+    url: https://github.com/ros-controls/ros2_controllers.git
+    version: 4.40.1
+
+  vcs_tiago_pro/realtime_tools:
+    type: git
+    url: https://github.com/ros-controls/realtime_tools.git
+    version: 4.6.0
+
+  vcs_tiago_pro/control_toolbox:
+    type: git
+    url: https://github.com/ros-controls/control_toolbox.git
+    version: 4.9.0
+
+  vcs_tiago_pro/control_msgs:
+    type: git
+    url: https://github.com/ros-controls/control_msgs.git
+    version: 5.7.0
+
+  vcs_tiago_pro/kinematics_interface:
+    type: git
+    url: https://github.com/ros-controls/kinematics_interface.git
+    version: 1.6.0
