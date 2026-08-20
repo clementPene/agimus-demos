@@ -1,0 +1,14 @@
+{
+  "title": "Visual servoing state",
+  "time": [],
+  "values": [],
+  "labels": [
+    "0 : IDLE, 1: VISUAL_SERVOING_ACTIVE, 2: COMING_BACK_TO_IDLE"
+  ],
+  "ylabels": [],
+  "semilogs": [],
+  "ylimits": [],
+  "colors": [
+    "#1f77b4"
+  ]
+}
