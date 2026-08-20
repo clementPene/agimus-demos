@@ -787,7 +787,23 @@ class Orchestrator:
         ee_input.pose.orientation.z = float(quat.z)
         ee_input.pose.orientation.w = float(quat.w)
         ee_input.w_pose = list(np.concatenate([W_FRAME_TRANS, W_FRAME_ROT]))
-        msg.ee_inputs = [ee_input]
+
+        # Force-feedback OCP (DAMSoftContactAugmentedFwdDynamics) requires every
+        # reference point to carry a forces[frame_id] entry for its contact frame,
+        # even when no force tracking is desired yet (ocp_croco_generic_force_feedback.py
+        # asserts the key exists) — see project_demo07_force_feedback_scoping memory.
+        # Left at msg field defaults (force=0, w_force=[0]*6): the zero weight keeps
+        # the force cost inactive (dam.active_contact stays False) until a real
+        # contact-force target/weight profile is designed for the insertion motion.
+        force_input = MpcEEInput()
+        force_input.frame_id = "wrist_right_ft_sensor_link"
+        # No pose-tracking cost reads this frame's pose (w_pose stays 0), but
+        # mocap_mpc_corrector.py applies its SE3 correction to every ee_inputs
+        # entry unconditionally — give it a valid unit quaternion rather than
+        # the message default (0,0,0,0), which is degenerate.
+        force_input.pose.orientation.w = 1.0
+
+        msg.ee_inputs = [ee_input, force_input]
         return msg
 
     def _build_messages(self, paths: list, n_hold: int = 200) -> list:
