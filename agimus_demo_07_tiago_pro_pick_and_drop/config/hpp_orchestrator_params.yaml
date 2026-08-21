@@ -46,26 +46,39 @@ tuck:
 # before the arm moves on to hover above the drop-zone box for placement
 # (see box: below — that target is computed via IK, not hardcoded here).
 carry:
-  arm_config: [2.8, -2.12, 2.35, -2.20, -2.6, 0.91, -0.26]
+  arm_config: [3.04, -1.84, 2.35, -1.73, -3.13, 1.19, -0.14]
+  # arm_config: [2.8, -2.12, 2.35, -2.20, -2.6, 0.91, -0.26]
 
 # ── Navigation target (base move between carry and place) ───────────────────
 # Pose sent to the navigate_to_pose action between the carry phase (p3) and
-# the place/release phase (gripper open + p4). PLACEHOLDER — fill in with the
-# real drop-zone pose (map frame) once the location is known.
+# the place/release phase (gripper open + p4). Captured from the real robot
+# (tiago-pro-43c) via `ros2 action send_goal /navigate_to_pose
+# nav2_msgs/action/NavigateToPose`; drop zone and initial pose are currently
+# the same map-frame location.
 nav:
   target_pose:
     frame_id: "map"
-    x: 0.0
-    y: 0.0
-    yaw: 0.0
+    x: 0.3750767707824707
+    y: -0.6120810508728027
+    # geometry_msgs/Quaternion, as sent in NavigateToPose.Goal.pose.pose.orientation.
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: -0.011218130761151156
+      w: 0.9999370747913219
   # Pose the base returns to after retracting from the drop zone (Phase 4),
-  # so a new pick-and-drop cycle can start from the same place. PLACEHOLDER —
-  # fill in with the real pick-location pose (map frame) once known.
+  # so a new pick-and-drop cycle can start from the same place. Same
+  # captured pose as target_pose (see above) — drop zone and initial point
+  # coincide for this setup.
   initial_pose:
     frame_id: "map"
-    x: 0.0
-    y: 0.0
-    yaw: 0.0
+    x: -1.2621469497680664
+    y: -1.1634714603424072
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.9998400751366411
+      w: 0.01788362800876907
 
 # ── Drop-zone container ───────────────────────────────────────────────────
 # A box the object is released into during p_place. This IS the source of

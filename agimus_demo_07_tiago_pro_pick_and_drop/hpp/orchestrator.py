@@ -227,17 +227,29 @@ LEFT_ARM_TUCK  = _cfg["tuck"]["left_arm"]
 RIGHT_ARM_TUCK = _cfg["tuck"]["right_arm"]
 CARRY_ARM_CFG  = np.array(_cfg["carry"]["arm_config"])
 
+def _nav_orientation_from_cfg(pose_cfg: dict) -> tuple:
+    """(x, y, z, w) of geometry_msgs/Quaternion — as sent in
+    NavigateToPose.Goal.pose.pose.orientation — from a nav.*_pose config
+    entry's `orientation` block. Defaults to the identity quaternion."""
+    orientation_cfg = pose_cfg.get("orientation", {})
+    return (
+        orientation_cfg.get("x", 0.0),
+        orientation_cfg.get("y", 0.0),
+        orientation_cfg.get("z", 0.0),
+        orientation_cfg.get("w", 1.0),
+    )
+
 _nav_target_cfg = _cfg.get("nav", {}).get("target_pose", {})
 NAV_TARGET_FRAME = _nav_target_cfg.get("frame_id", "map")
 NAV_TARGET_X   = _nav_target_cfg.get("x", 0.0)
 NAV_TARGET_Y   = _nav_target_cfg.get("y", 0.0)
-NAV_TARGET_YAW = _nav_target_cfg.get("yaw", 0.0)
+NAV_TARGET_QUATERNION = _nav_orientation_from_cfg(_nav_target_cfg)
 
 _nav_initial_cfg = _cfg.get("nav", {}).get("initial_pose", {})
 NAV_INITIAL_FRAME = _nav_initial_cfg.get("frame_id", "map")
 NAV_INITIAL_X   = _nav_initial_cfg.get("x", 0.0)
 NAV_INITIAL_Y   = _nav_initial_cfg.get("y", 0.0)
-NAV_INITIAL_YAW = _nav_initial_cfg.get("yaw", 0.0)
+NAV_INITIAL_QUATERNION = _nav_orientation_from_cfg(_nav_initial_cfg)
 
 NAVIGATE_TO_POSE_ACTION = "navigate_to_pose"
 
@@ -2698,16 +2710,17 @@ class Orchestrator:
     # ── Navigation ───────────────────────────────────────────────────────────
 
     def _navigate_to(
-        self, frame_id: str, x: float, y: float, yaw: float, label: str,
+        self, frame_id: str, x: float, y: float, quaternion: tuple, label: str,
         timeout: float = 10.0,
     ) -> bool:
-        """Send the base to (x, y, yaw) in frame_id via the navigate_to_pose
-        action, keeping the MPC controller fed with hold references while
-        waiting — mirrors _call_grasper_service. `timeout` only bounds
-        waiting for the action server to become available; once the goal is
-        sent, this blocks until the navigation result arrives (no separate
-        deadline), since the real drive time depends on distance. `label`
-        is only used for the printed progress/result messages."""
+        """Send the base to position (x, y) with orientation `quaternion`
+        (qx, qy, qz, qw) in frame_id via the navigate_to_pose action, keeping
+        the MPC controller fed with hold references while waiting — mirrors
+        _call_grasper_service. `timeout` only bounds waiting for the action
+        server to become available; once the goal is sent, this blocks until
+        the navigation result arrives (no separate deadline), since the real
+        drive time depends on distance. `label` is only used for the printed
+        progress/result messages."""
         if not self.enforce_navigation:
             print(f"  enforce_navigation is False — faking navigation to {label}.")
             return True
@@ -2725,16 +2738,20 @@ class Orchestrator:
             print(f"Navigation action server '{NAVIGATE_TO_POSE_ACTION}' is not available.")
             return False
 
+        qx, qy, qz, qw = quaternion
+
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose = PoseStamped()
         goal_msg.pose.header.frame_id = frame_id
         goal_msg.pose.pose.position.x = float(x)
         goal_msg.pose.pose.position.y = float(y)
-        goal_msg.pose.pose.orientation.z = float(np.sin(yaw / 2.0))
-        goal_msg.pose.pose.orientation.w = float(np.cos(yaw / 2.0))
+        goal_msg.pose.pose.orientation.x = float(qx)
+        goal_msg.pose.pose.orientation.y = float(qy)
+        goal_msg.pose.pose.orientation.z = float(qz)
+        goal_msg.pose.pose.orientation.w = float(qw)
 
         print(f"  Sending navigation goal ({label}): x={x}, y={y}, "
-              f"yaw={yaw} (frame='{frame_id}')")
+              f"orientation=({qx}, {qy}, {qz}, {qw}) (frame='{frame_id}')")
         send_goal_future = client.send_goal_async(goal_msg)
         self._spin_future_with_hold(node, send_goal_future)
 
@@ -2763,9 +2780,9 @@ class Orchestrator:
         return success
 
     def navigate_to_drop_zone(self, timeout: float = 10.0) -> bool:
-        """Send the base to NAV_TARGET_{X,Y,YAW} via the navigate_to_pose action."""
+        """Send the base to NAV_TARGET_{X,Y,QUATERNION} via the navigate_to_pose action."""
         return self._navigate_to(
-            NAV_TARGET_FRAME, NAV_TARGET_X, NAV_TARGET_Y, NAV_TARGET_YAW,
+            NAV_TARGET_FRAME, NAV_TARGET_X, NAV_TARGET_Y, NAV_TARGET_QUATERNION,
             "drop zone", timeout=timeout,
         )
 
@@ -2784,11 +2801,11 @@ class Orchestrator:
         return True
 
     def navigate_to_initial_pose(self, timeout: float = 10.0) -> bool:
-        """Send the base back to NAV_INITIAL_{X,Y,YAW} via the
+        """Send the base back to NAV_INITIAL_{X,Y,QUATERNION} via the
         navigate_to_pose action, so a new pick-and-drop cycle can start
         from the same place."""
         return self._navigate_to(
-            NAV_INITIAL_FRAME, NAV_INITIAL_X, NAV_INITIAL_Y, NAV_INITIAL_YAW,
+            NAV_INITIAL_FRAME, NAV_INITIAL_X, NAV_INITIAL_Y, NAV_INITIAL_QUATERNION,
             "initial point", timeout=timeout,
         )
 
