@@ -24,9 +24,17 @@ running_model:
     # point at the far end of the tool.
     oPc: [0.0, 0.0, 0.187928]
     with_gravity_torque_reg: true
-    enabled_directions: [true, true, true]
-    ref: LOCAL_WORLD_ALIGNED
-    cost_ref: LOCAL_WORLD_ALIGNED
+    # 1D contact along the tool's own pushing axis (confirmed with Clément
+    # 2026-08-21) — this is wrist_right_ft_sensor_link's local z (verified by
+    # FK: gripper_right_tool_holder sits at identity rotation from the sensor
+    # frame, i.e. the whole tool-mount chain extends along that same local
+    # z). Needs ref: LOCAL (not LOCAL_WORLD_ALIGNED) for "z" to mean the
+    # tool's pushing direction rather than world-vertical, which would only
+    # coincide with the real contact direction if the wrist happened to be
+    # perfectly vertical during insertion.
+    enabled_directions: [false, false, true]
+    ref: LOCAL
+    cost_ref: LOCAL
     costs:
     - name: state_reg
       update: true
@@ -80,9 +88,10 @@ terminal_model:
     frame_id: wrist_right_ft_sensor_link
     oPc: [0.0, 0.0, 0.187928]
     with_gravity_torque_reg: false
-    enabled_directions: [true, true, true]
-    ref: LOCAL_WORLD_ALIGNED
-    cost_ref: LOCAL_WORLD_ALIGNED
+    # See running_model.differential — same 1D tool-axis contact.
+    enabled_directions: [false, false, true]
+    ref: LOCAL
+    cost_ref: LOCAL
     costs:
     - name: state_reg
       update: true

@@ -154,10 +154,23 @@ class ForceSensorFilterNode(Node):
         self.declare_parameter("com_mass", 0.0)
         self.declare_parameter("filter_cutoff_hz", 18.0)
         self.declare_parameter("filter_sample_rate_hz", 1000.0)
-        # TODO: placeholder thresholds — tune from real contact/no-contact data.
-        self.declare_parameter("contact_axis_mask", "xyz")
-        self.declare_parameter("contact_lower_threshold", 5.0)
-        self.declare_parameter("contact_upper_threshold", 5.0)
+        # Raised with margin above the worst no-contact residual observed on
+        # robot (2026-08-20, post-calibration): 0.69N / 2.56N at 2 tested
+        # poses, on an URDF not yet corrected by the Figaroh kinematic
+        # calibration. The regression's own suggestion (2.21N) was BELOW that
+        # 2.56N no-contact residual — would have false-positived. Still not a
+        # real tuning (no actual contact/no-contact sweep done), and no
+        # hysteresis gap before this change (lower == upper == 5.0). See
+        # project_demo07_force_feedback_scoping memory.
+        # "z" = wrist_right_ft_sensor_link's own local z (raw sensor-frame
+        # reading, no rotation applied here) — the tool's pushing axis,
+        # confirmed with Clément 2026-08-21, matches enabled_directions in
+        # ocp_definition_file.yaml (1D contact, ref: LOCAL). Was "xyz" (norm
+        # over all 3 axes) — narrowing to z drops x/y calibration noise from
+        # the detector, it no longer needs to reflect what the OCP tracks.
+        self.declare_parameter("contact_axis_mask", "z")
+        self.declare_parameter("contact_lower_threshold", 4.0)
+        self.declare_parameter("contact_upper_threshold", 6.0)
         self.declare_parameter("contact_hysteresis_samples", 5)
 
         p = self.get_parameter
