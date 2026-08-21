@@ -11,8 +11,15 @@ running_model:
     # Franka config (contact stiffness/damping, not derived from our F/T
     # calibration — that calibrated mass/CoM for gravity comp, a different
     # physical quantity — Kp/Kv need real contact tuning on the robot).
-    Kp: [6000, 6000, 6000]
-    Kv: [100, 100, 100]
+    # Sized to 1 (not 3, unlike Franka's 3D config): with enabled_directions
+    # summing to 1, ocp_croco_generic_force_feedback.py's _dam_cls_and_kwargs
+    # switches to force_feedback_mpc.DAMSoftContact1DAugmentedFwdDynamics,
+    # which requires Kp/Kv of size 1 — passed through from here unsliced, no
+    # Python-side truncation happens. Missing this crashed
+    # DAMSoftContactAbstractAugmentedFwdDynamics's C++ constructor with
+    # "Kp and Kv must have size 1" (2026-08-21).
+    Kp: [6000]
+    Kv: [100]
     # Must match force_sensor_filter.py's contact_name / agimus_controller.py's
     # _FORCE_CONTACT_NAME (project_demo07_force_feedback_scoping memory).
     frame_id: wrist_right_ft_sensor_link
@@ -83,8 +90,9 @@ terminal_model:
   class: IAMSoftContactAugmented
   differential:
     class: DAMSoftContactAugmentedFwdDynamics
-    Kp: [6000, 6000, 6000]
-    Kv: [100, 100, 100]
+    # See running_model.differential — sized to 1, not 3 (1D contact).
+    Kp: [6000]
+    Kv: [100]
     frame_id: wrist_right_ft_sensor_link
     oPc: [0.0, 0.0, 0.187928]
     with_gravity_torque_reg: false
