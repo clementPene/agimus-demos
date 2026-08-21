@@ -19,13 +19,15 @@ that gap:
      this is what `OCPCrocoForceFeedbackGeneric` reads by frame name
      (`pt.point.forces[frame_id]`, see project_demo07_force_feedback_scoping memory).
 
-⚠️ NOT YET CALIBRATED — `com_mass`/`com_xyz` (pal-atc tool weight/CoM) and the
-contact thresholds are placeholders (0.0). Gravity compensation and contact
-detection will not be meaningful until these are measured on the real robot,
-the same way the Franka `calibration.com.*` parameters were.
+`com_mass`/`com_xyz` (pal-atc tool weight/CoM) calibrated on robot 2026-08-20
+(identification/ft_calibration/, 21 poses) and set as defaults below.
+⚠️ Not a precision calibration — URDF not yet corrected by the Figaroh
+kinematic calibration, and no real contact/no-contact sweep was done for the
+thresholds (raised with margin above the worst residual observed instead —
+see project_demo07_force_feedback_scoping memory). Both worth revisiting.
 
-⚠️ Raw wrench topic name (`--ros-args -p wrench_topic:=...`, default below)
-is unverified — confirm with `ros2 topic list` on the robot.
+Raw wrench topic name confirmed on robot 2026-08-20:
+`/ft_sensor_right_controller/wrench` (the default below).
 
 Subscriptions:
     /robot_description                                    (std_msgs/String, transient local)
@@ -149,9 +151,11 @@ class ForceSensorFilterNode(Node):
         self.declare_parameter("bias_measurement_samples", 50)
         self.declare_parameter("calibration_measurement_frame_xyz", [0.0, 0.0, 0.0])
         self.declare_parameter("calibration_measurement_frame_rpy", [0.0, 0.0, 0.0])
-        # TODO: not yet calibrated — see module docstring.
-        self.declare_parameter("com_xyz", [0.0, 0.0, 0.0])
-        self.declare_parameter("com_mass", 0.0)
+        # From identification/ft_calibration/calibrate_ft_sensor.py, 21 poses,
+        # 2026-08-20 (URDF not recalibrated by Figaroh — see module docstring
+        # and project_demo07_force_feedback_scoping memory for residuals/caveats).
+        self.declare_parameter("com_xyz", [0.00039, 0.00088, 0.05880])
+        self.declare_parameter("com_mass", 1.36619)
         self.declare_parameter("filter_cutoff_hz", 18.0)
         self.declare_parameter("filter_sample_rate_hz", 1000.0)
         # Raised with margin above the worst no-contact residual observed on

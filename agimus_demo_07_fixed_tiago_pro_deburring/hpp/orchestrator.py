@@ -87,6 +87,12 @@ W_COLLISION = _w["w_collision"]
 W_FRAME_TRANS = np.array(_w["w_frame_trans"])
 W_FRAME_ROT = np.array(_w["w_frame_rot"])
 
+_c = _cfg["contact"]
+FORCE_FRAME_ID = _c["frame_id"]
+CONTACT_FORCE_N = _c["force_n"]
+CONTACT_FORCE_RATE = _c["force_rate_n_per_s"]
+CONTACT_HOLD_S = _c["hold_s"]
+
 
 class _TrajectoryPublisherNode(Node):
     """One-shot ROS2 node that publishes pre-computed MpcInput messages."""
@@ -762,7 +768,7 @@ class Orchestrator:
         pin.updateFramePlacements(self.model, self._pin_data)
         return self._pin_data.oMf[self._ee_frame_id].copy()
 
-    def _build_msg(self, q, dq, ddq, msg_id):
+    def _build_msg(self, q, dq, ddq, msg_id, force_z: float = 0.0):
         msg = MpcInput()
         msg.id = msg_id
         msg.q = q.tolist()
@@ -790,21 +796,59 @@ class Orchestrator:
 
         # Force-feedback OCP (DAMSoftContactAugmentedFwdDynamics) requires every
         # reference point to carry a forces[frame_id] entry for its contact frame,
-        # even when no force tracking is desired yet (ocp_croco_generic_force_feedback.py
+        # even when no force tracking is desired (ocp_croco_generic_force_feedback.py
         # asserts the key exists) — see project_demo07_force_feedback_scoping memory.
-        # Left at msg field defaults (force=0, w_force=[0]*6): the zero weight keeps
-        # the force cost inactive (dam.active_contact stays False) until a real
-        # contact-force target/weight profile is designed for the insertion motion.
+        # force_z == 0.0 (p1/p2/p3/p4, everywhere but the contact hold) keeps
+        # w_force at all zeros: the force cost stays inactive
+        # (dam.active_contact == False), same as before this was wired up.
         force_input = MpcEEInput()
-        force_input.frame_id = "wrist_right_ft_sensor_link"
+        force_input.frame_id = FORCE_FRAME_ID
         # No pose-tracking cost reads this frame's pose (w_pose stays 0), but
         # mocap_mpc_corrector.py applies its SE3 correction to every ee_inputs
         # entry unconditionally — give it a valid unit quaternion rather than
         # the message default (0,0,0,0), which is degenerate.
         force_input.pose.orientation.w = 1.0
+        if force_z != 0.0:
+            force_input.force.force.z = float(force_z)
+            # z only — matches enabled_directions: [false, false, true] in
+            # ocp_definition_file.yaml (1D contact along the tool's local z).
+            force_input.w_force = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 
         msg.ee_inputs = [ee_input, force_input]
         return msg
+
+    def _append_contact_hold(self, msgs: list, idx: int) -> int:
+        """Ramp force 0 -> CONTACT_FORCE_N -> 0 while holding the last
+        configuration in `msgs` — inserted right after the insertion path
+        (p2), before retraction (p3) starts. Values from
+        hpp_orchestrator_params.yaml's `contact:` section, reused as-is from
+        Franka's metal deburring config. NOT tuned for TIAGo Pro — see
+        project_demo07_force_feedback_scoping memory."""
+        q_final = np.array(msgs[-1].q)
+        dq_zero = np.zeros(len(msgs[-1].qdot))
+        ddq_zero = np.zeros(len(msgs[-1].qddot))
+
+        ramp_n = max(1, round(CONTACT_FORCE_N / CONTACT_FORCE_RATE / DT))
+        dwell_n = max(1, round(CONTACT_HOLD_S / DT))
+        profile = np.concatenate(
+            [
+                np.linspace(0.0, CONTACT_FORCE_N, ramp_n, endpoint=False),
+                np.full(dwell_n, CONTACT_FORCE_N),
+                np.linspace(CONTACT_FORCE_N, 0.0, ramp_n, endpoint=False),
+            ]
+        )
+        print(
+            f"  contact hold: {len(profile)} waypoints "
+            f"({ramp_n} ramp up, {dwell_n} dwell @ {CONTACT_FORCE_N}N, {ramp_n} ramp down)"
+        )
+        for f in profile:
+            # Sign per metal_deburring_trajectory.py's `f.linear[2] = -force`
+            # convention — NOT verified on TIAGo Pro, check on first contact test.
+            msgs.append(
+                self._build_msg(q_final, dq_zero, ddq_zero, idx, force_z=-float(f))
+            )
+            idx += 1
+        return idx
 
     def _build_messages(self, paths: list, n_hold: int = 200) -> list:
         """
@@ -819,6 +863,8 @@ class Orchestrator:
             for q, dq, ddq in zip(q_arr, dq_arr, ddq_arr):
                 msgs.append(self._build_msg(q, dq, ddq, idx))
                 idx += 1
+            if "insertion" in label:
+                idx = self._append_contact_hold(msgs, idx)
         q_final = msgs[-1].q
         dq_zero = np.zeros(len(msgs[-1].qdot)).tolist()
         ddq_zero = np.zeros(len(msgs[-1].qddot)).tolist()
