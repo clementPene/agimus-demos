@@ -52,4 +52,4 @@ contact:
   # Raise once the sign/behavior is confirmed safe.
   force_n: 5.0              # target insertion contact force (N), tool z axis
   force_rate_n_per_s: 100.0  # ramp rate, up and down
-  hold_s: 1.0               # dwell time at full force
+  hold_s: 3.0               # dwell time at full force

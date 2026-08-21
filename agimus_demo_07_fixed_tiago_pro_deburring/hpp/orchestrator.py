@@ -768,7 +768,13 @@ class Orchestrator:
         pin.updateFramePlacements(self.model, self._pin_data)
         return self._pin_data.oMf[self._ee_frame_id].copy()
 
-    def _build_msg(self, q, dq, ddq, msg_id, force_z: float = 0.0):
+    def _build_msg(
+        self, q, dq, ddq, msg_id, force_z: float = 0.0, w_frame_trans=None
+    ):
+        """w_frame_trans: override for the EE translation weight (position
+        x/y/z of gripper_right_tool_holder), defaults to W_FRAME_TRANS.
+        Orientation weight (W_FRAME_ROT) is never overridden — see
+        _append_contact_hold()."""
         msg = MpcInput()
         msg.id = msg_id
         msg.q = q.tolist()
@@ -792,7 +798,8 @@ class Orchestrator:
         ee_input.pose.orientation.y = float(quat.y)
         ee_input.pose.orientation.z = float(quat.z)
         ee_input.pose.orientation.w = float(quat.w)
-        ee_input.w_pose = list(np.concatenate([W_FRAME_TRANS, W_FRAME_ROT]))
+        trans_w = W_FRAME_TRANS if w_frame_trans is None else w_frame_trans
+        ee_input.w_pose = list(np.concatenate([trans_w, W_FRAME_ROT]))
 
         # Force-feedback OCP (DAMSoftContactAugmentedFwdDynamics) requires every
         # reference point to carry a forces[frame_id] entry for its contact frame,
@@ -812,7 +819,11 @@ class Orchestrator:
             force_input.force.force.z = float(force_z)
             # z only — matches enabled_directions: [false, false, true] in
             # ocp_definition_file.yaml (1D contact along the tool's local z).
-            force_input.w_force = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+            # Weight 0.015 reused from Franka's deburring_motion.w_desired_force
+            # (deburring_path_planner_params.yaml) — same cost formulation
+            # (ocp_croco_generic_force_feedback.py is shared code), so more
+            # grounded than an arbitrary guess.
+            force_input.w_force = [0.0, 0.0, 0.015, 0.0, 0.0, 0.0]
 
         msg.ee_inputs = [ee_input, force_input]
         return msg
@@ -841,11 +852,26 @@ class Orchestrator:
             f"  contact hold: {len(profile)} waypoints "
             f"({ramp_n} ramp up, {dwell_n} dwell @ {CONTACT_FORCE_N}N, {ramp_n} ramp down)"
         )
+        # Translation tracking off during the hold — same as Franka's
+        # deburring_motion.w_frame_translation: [0,0,0] (insert_retract_tool
+        # uses [150,150,150]): lets the force cost alone shape the tool's
+        # advance instead of fighting a full-strength position hold (see
+        # project_demo07_force_feedback_scoping memory for why). Orientation
+        # weight (W_FRAME_ROT) is left untouched — the tool shouldn't tip
+        # over while pushing.
+        zero_trans = np.zeros(3)
         for f in profile:
             # Sign per metal_deburring_trajectory.py's `f.linear[2] = -force`
             # convention — NOT verified on TIAGo Pro, check on first contact test.
             msgs.append(
-                self._build_msg(q_final, dq_zero, ddq_zero, idx, force_z=-float(f))
+                self._build_msg(
+                    q_final,
+                    dq_zero,
+                    ddq_zero,
+                    idx,
+                    force_z=-float(f),
+                    w_frame_trans=zero_trans,
+                )
             )
             idx += 1
         return idx
