@@ -861,15 +861,18 @@ class Orchestrator:
         # over while pushing.
         zero_trans = np.zeros(3)
         for f in profile:
-            # Sign per metal_deburring_trajectory.py's `f.linear[2] = -force`
-            # convention — NOT verified on TIAGo Pro, check on first contact test.
+            # Sign confirmed empirically on TIAGo Pro (2026-08-21, Clément):
+            # pushing the tool forward along its own axis reads POSITIVE
+            # force.z on /sensor_with_force — opposite of Franka's
+            # `f.linear[2] = -force` convention (metal_deburring_trajectory.py),
+            # which doesn't transfer (different sensor/frame mounting).
             msgs.append(
                 self._build_msg(
                     q_final,
                     dq_zero,
                     ddq_zero,
                     idx,
-                    force_z=-float(f),
+                    force_z=float(f),
                     w_frame_trans=zero_trans,
                 )
             )
