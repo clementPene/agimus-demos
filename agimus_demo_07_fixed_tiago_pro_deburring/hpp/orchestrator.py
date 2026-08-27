@@ -852,14 +852,21 @@ class Orchestrator:
             f"  contact hold: {len(profile)} waypoints "
             f"({ramp_n} ramp up, {dwell_n} dwell @ {CONTACT_FORCE_N}N, {ramp_n} ramp down)"
         )
-        # Translation tracking off during the hold — same as Franka's
-        # deburring_motion.w_frame_translation: [0,0,0] (insert_retract_tool
-        # uses [150,150,150]): lets the force cost alone shape the tool's
-        # advance instead of fighting a full-strength position hold (see
-        # project_demo07_force_feedback_scoping memory for why). Orientation
-        # weight (W_FRAME_ROT) is left untouched — the tool shouldn't tip
-        # over while pushing.
-        zero_trans = np.zeros(3)
+        # Non-zero translation weight during the hold — switched from
+        # Franka's deburring_motion profile ([0,0,0], force cost alone
+        # shapes the advance) to its insert_retract_tool profile
+        # ([150,150,150]): the tiago_pro_force_mpc_sim MuJoCo testbed found
+        # a non-zero translation weight (150) was part of its clean,
+        # spike-free result — a full-zero translation hold was never
+        # validated there. NOT axis-masked to the push direction alone
+        # (the testbed does mask the push axis out of its translation cost,
+        # but that requires knowing the push axis in the *world* frame this
+        # residual is actually computed in — ResidualModelFrameTranslation
+        # is a raw world-frame xyz residual, not local-to-tool — unverified
+        # here via FK, so kept uniform on all 3 axes rather than guessed).
+        # Orientation weight (W_FRAME_ROT) is left untouched — the tool
+        # shouldn't tip over while pushing.
+        hold_trans_weight = np.array([150.0, 150.0, 150.0])
         for f in profile:
             # Sign confirmed empirically on TIAGo Pro (2026-08-21, Clément):
             # pushing the tool forward along its own axis reads POSITIVE
@@ -873,7 +880,7 @@ class Orchestrator:
                     ddq_zero,
                     idx,
                     force_z=float(f),
-                    w_frame_trans=zero_trans,
+                    w_frame_trans=hold_trans_weight,
                 )
             )
             idx += 1

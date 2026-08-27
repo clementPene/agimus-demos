@@ -6,11 +6,14 @@ running_model:
   class: IAMSoftContactAugmented
   differential:
     class: DAMSoftContactAugmentedFwdDynamics
-    # Soft contact model — see agimus_demo_07_deburring/config/metal/ocp_definition_file.yaml
-    # (Franka reference). Kp/Kv are placeholder starting points copied from the
-    # Franka config (contact stiffness/damping, not derived from our F/T
-    # calibration — that calibrated mass/CoM for gravity comp, a different
-    # physical quantity — Kp/Kv need real contact tuning on the robot).
+    # Soft contact model. Kp=9000/Kv=300 (not Franka's placeholders
+    # Kp=6000/Kv=100) — matches the standalone tiago_pro_force_mpc_sim
+    # MuJoCo testbed's "current best result" config.yaml. Kv in particular
+    # was found there to be the single biggest lever (Kv=100 gave a
+    # sharp/non-monotonic weight landscape; Kv=300 made every other
+    # cost-weight sweep smooth and monotonic — see that project's NOTES.md).
+    # Still simulation-derived, not re-tuned against the real contact —
+    # start cautious on robot.
     # Sized to 1 (not 3, unlike Franka's 3D config): with enabled_directions
     # summing to 1, ocp_croco_generic_force_feedback.py's _dam_cls_and_kwargs
     # switches to force_feedback_mpc.DAMSoftContact1DAugmentedFwdDynamics,
@@ -18,8 +21,8 @@ running_model:
     # Python-side truncation happens. Missing this crashed
     # DAMSoftContactAbstractAugmentedFwdDynamics's C++ constructor with
     # "Kp and Kv must have size 1" (2026-08-21).
-    Kp: [6000]
-    Kv: [100]
+    Kp: [4000]
+    Kv: [400]
     # Must match force_sensor_filter.py's contact_name / agimus_controller.py's
     # _FORCE_CONTACT_NAME (project_demo07_force_feedback_scoping memory).
     frame_id: wrist_right_ft_sensor_link
@@ -53,16 +56,12 @@ running_model:
           weights: 1.0
         residual:
           class: ResidualModelState
-    - name: control_reg
-      update: true
-      weight: 1.0
-      cost:
-        class: CostModelResidual
-        activation:
-          class: ActivationModelWeightedQuad
-          weights: 1.0
-        residual:
-          class: ResidualModelControl
+    # No control_reg here (ResidualModelControl, torque-toward-zero) on top
+    # of with_gravity_torque_reg (torque-toward-gravity-comp): the two pull
+    # commanded torque toward two different references at once, which the
+    # tiago_pro_force_mpc_sim MuJoCo testbed confirmed reliably breaks force
+    # tracking — a production code comment already suspected this exact
+    # combo contributed to the 2026-08-21 real overshoot incident.
     - name: frame_trans_tracking_tool
       update: true
       weight: 1.0
@@ -91,8 +90,8 @@ terminal_model:
   differential:
     class: DAMSoftContactAugmentedFwdDynamics
     # See running_model.differential — sized to 1, not 3 (1D contact).
-    Kp: [6000]
-    Kv: [100]
+    Kp: [4000]
+    Kv: [400]
     frame_id: wrist_right_ft_sensor_link
     oPc: [0.0, 0.0, 0.187928]
     with_gravity_torque_reg: false

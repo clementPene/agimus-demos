@@ -34,22 +34,19 @@ weights:
 # Applied between the p2 (insertion) and p3 (retraction) paths: ramp
 # force_n/force_rate_n_per_s up, dwell hold_s at force_n, ramp back down —
 # see orchestrator.py's _build_messages()/_append_contact_hold().
-# Values reused as-is from Franka's metal deburring config
-# (agimus_demo_07_deburring/config/metal/deburring_path_planner_params.yaml:
-# positioning_force=deburring_force=40N, force_rate_up=force_rate_down=100N/s,
-# positioning_time=1.0s) — per Clément 2026-08-21. NONE of this is tuned for
-# TIAGo Pro: Kp/Kv in ocp_definition_file.yaml are also Franka placeholders,
-# and the sign convention (orchestrator.py) is copied from
-# metal_deburring_trajectory.py's `f.linear[2] = -force` without being
-# verified on TIAGo Pro's actual sensor/frame orientation. Recommend testing
-# with a much lower force_n first (e.g. 5-10N) before trusting 40N — sign,
-# Kp/Kv and force magnitude are all untested together for the first time
-# here. See project_demo07_force_feedback_scoping memory.
+# force_rate_n_per_s set so the ramp duration matches force_ramp_time≈1.0s
+# from the tiago_pro_force_mpc_sim MuJoCo testbed (that project's cleanest,
+# spike-free result) rather than Franka's ~100N/s placeholder. force_n=20N:
+# between the original cautious first-contact value (5N, sign/Kp/Kv/Kv=300
+# switch not yet tested together on the real robot at all) and the
+# testbed's own validated target (50N) — a middle step, not the final
+# value. Raise once this is confirmed stable and safe on the real robot.
+# The sign convention (orchestrator.py) was confirmed empirically on
+# TIAGo Pro 2026-08-21 (opposite Franka's, see orchestrator.py comment) —
+# Kp/Kv (now Kv=300, see ocp_definition_file.yaml) still not re-verified on
+# real contact. See project_demo07_force_feedback_scoping memory.
 contact:
   frame_id: wrist_right_ft_sensor_link
-  # Lowered from Franka's 40N for the first-ever real contact test on TIAGo
-  # Pro (sign convention + Kp/Kv both untested too — see comment above).
-  # Raise once the sign/behavior is confirmed safe.
-  force_n: 5.0              # target insertion contact force (N), tool z axis
-  force_rate_n_per_s: 100.0  # ramp rate, up and down
+  force_n: 20.0              # target insertion contact force (N), tool z axis
+  force_rate_n_per_s: 20.0   # ramp rate, up and down — force_n / force_ramp_time (1.0s)
   hold_s: 3.0               # dwell time at full force
