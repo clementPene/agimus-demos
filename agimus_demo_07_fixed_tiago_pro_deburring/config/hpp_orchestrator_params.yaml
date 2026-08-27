@@ -54,3 +54,9 @@ contact:
   press_ramp_s: 1.5        # ramp the target offset in, and back out, over this
   press_hold_s: 3.0        # dwell at full press_depth_m
   w_force_marker: 1.0e-4   # tiny w_force during the press to enable active_contact
+  # The ONE press-specific cost weight (p1/p2/p3/p4 keep weights.w_frame_trans
+  # = 1000). The tiago_pro_force_mpc_sim MuJoCo testbed showed a clean
+  # guarded-move push needs a MUCH softer translation weight — pushing a
+  # past-the-wall target at 1000 slams the contact (peak ~70 N vs a 20 N
+  # ceiling); ~60 gave a spike-free push that settled exactly on the cap.
+  press_w_frame_trans: 60.0

@@ -103,7 +103,7 @@ W_FORCE_MARKER = _c["w_force_marker"]
 # push needs a much softer translation weight than the 1000 used for
 # free-space tracking — a stiff one slams the wall on contact. Applied on
 # all 3 axes during the press only.
-PRESS_W_FRAME_TRANS = np.full(3, _c["press_w_frame_trans"])
+PRESS_W_FRAME_TRANS = np.full(3, _c.get("press_w_frame_trans", 60.0))
 
 # ── Optional rosbag recording around execute() ───────────────────────────────
 # Opt in per-call with execute(record=True) (or record="sometag"), or set
