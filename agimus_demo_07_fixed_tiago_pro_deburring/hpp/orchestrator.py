@@ -22,9 +22,11 @@ Run via orchestrator_node.py (sources both ros2_config.sh and hpp_config.sh).
 """
 
 import os
+import signal
 import subprocess
 import sys
 import glob
+import shutil
 import tempfile
 import time
 import xml.etree.ElementTree as ET
@@ -92,6 +94,32 @@ FORCE_FRAME_ID = _c["frame_id"]
 CONTACT_FORCE_N = _c["force_n"]
 CONTACT_FORCE_RATE = _c["force_rate_n_per_s"]
 CONTACT_HOLD_S = _c["hold_s"]
+# Weights active only during the contact-hold phase (override the global
+# `weights:` block for that phase). See hpp_orchestrator_params.yaml's
+# `contact:` section for the rationale — both were hardcoded here before.
+CONTACT_HOLD_W_FRAME_TRANS = np.array(_c["w_frame_trans"])
+CONTACT_FORCE_W = _c["w_force_z"]
+
+# ── Optional rosbag recording around execute() ───────────────────────────────
+# Opt in per-call with execute(record=True) (or record="sometag"), or set
+# o.record = True once for the session. Bags land in <source>/plot/runs/ and
+# feed plot/plot_force_profile.py directly — no second terminal needed.
+#
+# realpath (not _PKG_DIR): `plot/` is NOT in CMakeLists' INSTALL_TO_SHARE, so
+# under --symlink-install the installed orchestrator.py is a symlink back to
+# the source tree — resolving it lands the runs next to plot_force_profile.py
+# instead of in an install-space `plot/` that nothing else looks at.
+_SRC_PKG_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+_RUNS_DIR = os.path.join(_SRC_PKG_DIR, "plot", "runs")
+_PLOT_SCRIPT = os.path.join(_SRC_PKG_DIR, "plot", "plot_force_profile.py")
+RECORD_TOPICS = [
+    "/sensor_with_force",  # measured force (contacts[FT].wrench) + contact.active
+    "/mpc_input",          # target force ramp (ee_inputs[FT].force)
+    "/control",            # commanded feedforward torque -> |u|
+    "/ocp_x0",             # augmented x0 actually fed to the solver
+    "/ocp_solve_time",
+    "/mpc_debug",           # KKT norm, iters
+]
 
 
 class _TrajectoryPublisherNode(Node):
@@ -135,6 +163,9 @@ class Orchestrator:
         self._ros_node = ros_node
         self.p1 = self.p2 = self.p3 = self.p4 = None
         self._messages = None
+        # Set True to auto-record every execute() run (see RECORD_TOPICS /
+        # execute(record=...)). Per-call `record=` overrides this.
+        self.record = False
 
         print("Loading HPP model …")
         self._setup_model()
@@ -819,11 +850,8 @@ class Orchestrator:
             force_input.force.force.z = float(force_z)
             # z only — matches enabled_directions: [false, false, true] in
             # ocp_definition_file.yaml (1D contact along the tool's local z).
-            # Weight 0.015 reused from Franka's deburring_motion.w_desired_force
-            # (deburring_path_planner_params.yaml) — same cost formulation
-            # (ocp_croco_generic_force_feedback.py is shared code), so more
-            # grounded than an arbitrary guess.
-            force_input.w_force = [0.0, 0.0, 0.015, 0.0, 0.0, 0.0]
+            # Weight from hpp_orchestrator_params.yaml `contact.w_force_z`.
+            force_input.w_force = [0.0, 0.0, CONTACT_FORCE_W, 0.0, 0.0, 0.0]
 
         msg.ee_inputs = [ee_input, force_input]
         return msg
@@ -852,21 +880,33 @@ class Orchestrator:
             f"  contact hold: {len(profile)} waypoints "
             f"({ramp_n} ramp up, {dwell_n} dwell @ {CONTACT_FORCE_N}N, {ramp_n} ramp down)"
         )
-        # Non-zero translation weight during the hold — switched from
-        # Franka's deburring_motion profile ([0,0,0], force cost alone
-        # shapes the advance) to its insert_retract_tool profile
-        # ([150,150,150]): the tiago_pro_force_mpc_sim MuJoCo testbed found
-        # a non-zero translation weight (150) was part of its clean,
-        # spike-free result — a full-zero translation hold was never
-        # validated there. NOT axis-masked to the push direction alone
-        # (the testbed does mask the push axis out of its translation cost,
-        # but that requires knowing the push axis in the *world* frame this
-        # residual is actually computed in — ResidualModelFrameTranslation
-        # is a raw world-frame xyz residual, not local-to-tool — unverified
-        # here via FK, so kept uniform on all 3 axes rather than guessed).
+        # Translation weight during the hold — hpp_orchestrator_params.yaml's
+        # `contact.w_frame_trans`, with the push direction masked out (as the
+        # tiago_pro_force_mpc_sim MuJoCo testbed does, ocp.py:
+        #   trans_w = translation_weight * (1 - |push_axis|)  ).
+        # Along the push axis the force cost alone should set the advance; a
+        # non-zero translation weight there fights it (the "sharp,
+        # non-monotone weights" landscape in that project's NOTES.md).
+        #
+        # The testbed mask is binary ([1,0,0] -> [0,1,1]) because its wall is
+        # world-axis-aligned. Here the push is the tool's LOCAL z
+        # (enabled_directions [f,f,t], ref: LOCAL) while
+        # ResidualModelFrameTranslation's residual is WORLD-frame xyz, so the
+        # world push axis is R_world_tool @ z_hat — a general direction — and
+        # the mask is fractional. q_final is frozen for the whole hold, so
+        # compute it once. abs(): the ±z sign of the push (see the URDF
+        # tool-mount comment in _setup_model vs the +z in ocp_definition_file)
+        # is irrelevant for masking an axis.
         # Orientation weight (W_FRAME_ROT) is left untouched — the tool
         # shouldn't tip over while pushing.
-        hold_trans_weight = np.array([150.0, 150.0, 150.0])
+        R_world_tool = self._fk_ee(q_final).rotation
+        push_world = np.abs(R_world_tool @ np.array([0.0, 0.0, 1.0]))
+        hold_trans_weight = CONTACT_HOLD_W_FRAME_TRANS * (1.0 - push_world)
+        print(
+            f"  contact hold: push axis (world) ~{np.round(push_world, 2)} -> "
+            f"w_frame_trans {np.round(CONTACT_HOLD_W_FRAME_TRANS, 0)} "
+            f"masked to {np.round(hold_trans_weight, 1)}"
+        )
         for f in profile:
             # Sign confirmed empirically on TIAGo Pro (2026-08-21, Clément):
             # pushing the tool forward along its own axis reads POSITIVE
@@ -915,12 +955,51 @@ class Orchestrator:
 
     # ── Execution ─────────────────────────────────────────────────────────────
 
-    def execute(self, paths=None):
+    def _start_bag(self, tag: str = ""):
+        """Spawn `ros2 bag record` for RECORD_TOPICS, scoped to one execute()
+        call. Best-effort: returns None (and never raises) if `ros2` is
+        missing or the recorder fails to start, so a run is never blocked."""
+        if shutil.which("ros2") is None:
+            print("  record: `ros2` not on PATH — skipping bag.")
+            return None
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        out = os.path.join(_RUNS_DIR, f"{stamp}_{tag}" if tag else stamp)
+        os.makedirs(_RUNS_DIR, exist_ok=True)
+        proc = subprocess.Popen(
+            ["ros2", "bag", "record", "-o", out, *RECORD_TOPICS],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(1.0)  # let discovery + subscriptions settle before publishing
+        if proc.poll() is not None:
+            print("  record: `ros2 bag record` exited immediately — skipping bag.")
+            return None
+        print(f"  record: {out}")
+        return proc, out
+
+    def _stop_bag(self, handle) -> None:
+        if handle is None:
+            return
+        proc, out = handle
+        time.sleep(1.5)  # let the last sensor/force/control messages land
+        proc.send_signal(signal.SIGINT)  # ros2 bag finalises the DB on SIGINT
+        try:
+            proc.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        print(f"  record: wrote {out}")
+        print(f"  plot:   python3 {_PLOT_SCRIPT} {out}")
+
+    def execute(self, paths=None, record=None):
         """
         Sample and publish MpcInput messages to the controller.
 
-        paths : list of Path objects to execute in sequence.
-                Defaults to [p1, p2, p3, p4].
+        paths  : list of Path objects to execute in sequence.
+                 Defaults to [p1, p2, p3, p4].
+        record : True (or a str tag) wraps the run in a `ros2 bag record` of
+                 RECORD_TOPICS under plot/runs/<timestamp>[_tag]/ — feeds
+                 plot/plot_force_profile.py directly, no second terminal.
+                 None (default) falls back to self.record.
         """
         if self.p1 is None:
             print("No path available — run plan() first.")
@@ -949,6 +1028,10 @@ class Orchestrator:
                 DT, self._ros_node._publish_next
             )
 
+        do_record = self.record if record is None else record
+        tag = do_record if isinstance(do_record, str) else ""
+        bag = self._start_bag(tag) if do_record else None
+
         print("Publishing trajectory …")
         try:
             while not self._ros_node._done:
@@ -956,6 +1039,8 @@ class Orchestrator:
                 time.sleep(DT)
         except KeyboardInterrupt:
             print("\nExecution interrupted.")
+        finally:
+            self._stop_bag(bag)
 
     # ── Pose comparison ───────────────────────────────────────────────────────
 

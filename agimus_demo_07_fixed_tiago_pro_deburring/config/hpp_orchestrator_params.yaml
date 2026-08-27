@@ -50,3 +50,24 @@ contact:
   force_n: 20.0              # target insertion contact force (N), tool z axis
   force_rate_n_per_s: 20.0   # ramp rate, up and down — force_n / force_ramp_time (1.0s)
   hold_s: 3.0               # dwell time at full force
+  # Cost weights that apply ONLY during the contact-hold phase (they
+  # override the global `weights:` block above for that phase only; p1/p2/
+  # p3/p4 motion is unaffected). Both were hardcoded in orchestrator.py
+  # before — see _append_contact_hold() / _build_msg().
+  # w_frame_trans: tool-tip translation tracking during the hold. Dropped
+  #   from weights.w_frame_trans (1000) to 150 so the force cost can shape
+  #   the push — the tiago_pro_force_mpc_sim MuJoCo testbed found a non-zero
+  #   150 (from Franka's insert_retract_tool profile) part of its clean,
+  #   spike-free result; a full-zero hold was never validated there.
+  #   These 3 values are the UNMASKED weight — orchestrator.py's
+  #   _append_contact_hold() then zeroes the push-direction component
+  #   (w * (1 - |R_world_tool @ z_hat|)), matching the testbed's
+  #   trans_w = w * (1 - |push_axis|), so translation tracking never fights
+  #   the force cost along the advance direction.
+  # w_force_z: force-tracking weight on the tool's local z (1D contact,
+  #   enabled_directions [f,f,t] in ocp_definition_file.yaml). 0.015 reused
+  #   from Franka's deburring_motion.w_desired_force (shared code path,
+  #   ocp_croco_generic_force_feedback.py) — grounded, not a validated
+  #   TIAGo value.
+  w_frame_trans: [150.0, 150.0, 150.0]
+  w_force_z: 0.015

@@ -1,0 +1,3 @@
+# Rosbags recorded by orchestrator.py's execute(record=...). Committed
+# reference runs (e.g. mpc_lfc_bag/) are force-added explicitly.
+runs/

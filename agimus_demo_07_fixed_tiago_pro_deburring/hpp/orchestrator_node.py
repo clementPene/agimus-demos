@@ -12,6 +12,21 @@ Drops into an IPython shell with the orchestrator pre-loaded:
     o.plan()              # plan with HPP (approach + insert + retract)
     o.execute()           # publish trajectory to MPC controller
     o.plan_and_execute()  # both
+
+Recording & force plots
+    o.execute(record=True)          # wrap the run in a `ros2 bag record`
+    o.execute([o.p2], record="nowall")   # tag it; p2 also appends the contact hold
+    o.record = True                 # ...or auto-record every execute() this session
+
+    Bags land in  <pkg>/plot/runs/<timestamp>[_tag]/  (RECORD_TOPICS in
+    orchestrator.py: /sensor_with_force, /mpc_input, /control, /ocp_x0,
+    /ocp_solve_time, /mpc_debug). execute() prints the ready-to-run plot
+    command when it finishes:
+
+        python3 plot/plot_force_profile.py plot/runs/<timestamp>[_tag]
+
+    -> 3-panel figure (f_z measured vs target / |dq| / |u|), the real-robot
+    analogue of tiago_pro_force_mpc_sim/closed_loop_mujoco.py.
 """
 
 import sys
@@ -49,7 +64,15 @@ banner = (
     "║    o.plan()                      — run HPP planner                ║\n"
     "║    o.execute()                   — publish full trajectory to MPC ║\n"
     "║    o.execute([o.p1])             — publish p1 only (approach)     ║\n"
+    "║    o.execute([o.p2])             — p2 + its contact hold phase    ║\n"
     "║    o.plan_and_execute()          — plan then execute              ║\n"
+    "╠════════════════════════════════════════════════════════════════════╣\n"
+    "║  Recording & force plots                                          ║\n"
+    "║    o.execute(record=True)        — wrap run in `ros2 bag record`  ║\n"
+    "║    o.execute([o.p2], record='x') — tag the bag 'x'                ║\n"
+    "║    o.record = True               — auto-record every execute()    ║\n"
+    "║    bags -> <pkg>/plot/runs/<timestamp>[_tag]/                     ║\n"
+    "║    then: python3 plot/plot_force_profile.py plot/runs/<...>       ║\n"
     "╠════════════════════════════════════════════════════════════════════╣\n"
     "║  Diagnostics                                                      ║\n"
     "║    o.compare_pose()              — qg vs actual robot FK          ║\n"
