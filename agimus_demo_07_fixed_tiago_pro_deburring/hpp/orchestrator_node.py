@@ -15,7 +15,7 @@ Drops into an IPython shell with the orchestrator pre-loaded:
 
 Recording & force plots
     o.execute(record=True)          # wrap the run in a `ros2 bag record`
-    o.execute([o.p2], record="nowall")   # tag it; p2 also appends the contact hold
+    o.execute([o.p2], record="nowall")   # tag it; p2 also appends the guarded-move press
     o.record = True                 # ...or auto-record every execute() this session
 
     Bags land in  <pkg>/plot/runs/<timestamp>[_tag]/  (RECORD_TOPICS in
@@ -64,7 +64,7 @@ banner = (
     "║    o.plan()                      — run HPP planner                ║\n"
     "║    o.execute()                   — publish full trajectory to MPC ║\n"
     "║    o.execute([o.p1])             — publish p1 only (approach)     ║\n"
-    "║    o.execute([o.p2])             — p2 + its contact hold phase    ║\n"
+    "║    o.execute([o.p2])             — p2 + its guarded-move press    ║\n"
     "║    o.plan_and_execute()          — plan then execute              ║\n"
     "╠════════════════════════════════════════════════════════════════════╣\n"
     "║  Recording & force plots                                          ║\n"

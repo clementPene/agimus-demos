@@ -23,7 +23,9 @@ Then:
 
 Signals
     f_z measured : /sensor_with_force  contacts[FT frame].wrench.force.z   (filtered, grav-comp)
-    f_z target   : /mpc_input          ee_inputs[FT frame].force.force.z   (orchestrator ramp)
+    f_max ceiling: ±--f-max drawn as dashed lines (the |f| box constraint in
+                   ocp_definition_file.yaml running_model.force_ub — the guarded-move
+                   design has NO force setpoint, so /mpc_input force is ~0)
     contact flag : /sensor_with_force  contacts[FT frame].active           (hysteresis detector)
     |dq|         : /sensor_with_force  joint_state.velocity  -> L2 norm
     |u|          : /control            feedforward           -> L2 norm
@@ -57,9 +59,14 @@ _TYPES = {
 def _iter_bag(bag: Path):
     """Yield (topic, deserialized_msg, t_ns) for the topics in _TYPES.
 
+    `bag` is the bag directory (the one holding metadata.yaml + *.db3); a
+    path straight to a .db3/.mcap file is also accepted.
+
     Prefers a direct sqlite3 read (no rosbag2_py needed — works in the plain
     tiago_pro_nix devshell); falls back to rosbag2_py for .mcap bags.
     """
+    if bag.is_file():
+        bag = bag.parent
     db3 = sorted(bag.glob("*.db3"))
     if db3:
         con = sqlite3.connect(f"file:{db3[0]}?mode=ro", uri=True)
@@ -164,9 +171,15 @@ def main():
     p.add_argument("bag", type=Path)
     p.add_argument("--out", default=None, help="output PNG (default: <bag>.png)")
     p.add_argument("--force-frame", default=FT_FRAME_DEFAULT)
+    p.add_argument(
+        "--f-max", type=float, default=20.0,
+        help="force box-constraint ceiling to draw as ±lines (ocp_definition_file.yaml running_model.force_ub)",
+    )
     p.add_argument("--t0", type=float, default=None, help="crop start (s)")
     p.add_argument("--t1", type=float, default=None, help="crop end (s)")
     args = p.parse_args()
+    if args.bag.is_file():  # a .db3/.mcap was passed — use its directory
+        args.bag = args.bag.parent
 
     d = load(args.bag, args.force_frame)
     if len(d["t_f"]) == 0:
@@ -183,19 +196,25 @@ def main():
     m = (d["t_f"] >= lo) & (d["t_f"] <= hi)
     fw = d["f_meas"][m]
     steady = float(np.mean(fw[-max(1, len(fw) // 5):])) if len(fw) else float("nan")
-    des_win = d["f_des"][(d["t_des"] >= lo) & (d["t_des"] <= hi)] if len(d["t_des"]) else np.array([])
-    target = des_win[np.argmax(np.abs(des_win))] if len(des_win) else float("nan")
+    peak = fw[np.argmax(np.abs(fw))] if len(fw) else float("nan")
     print(
         f"f_z: final {fw[-1]:.2f} N | steady (last 20%) {steady:.2f} N | "
-        f"peak {fw[np.argmax(np.abs(fw))]:.2f} N | target ~{target:.1f} N"
+        f"peak {peak:.2f} N | f_max cap ±{args.f_max:.0f} N"
+        f"{'  ⚠ EXCEEDED' if abs(peak) > args.f_max + 0.5 else ''}"
     )
 
     fig, ax = plt.subplots(3, 1, figsize=(9, 9), sharex=True)
 
     _shade_active(ax[0], d["t_f"], d["active"])
     ax[0].plot(d["t_f"], d["f_meas"], lw=1.0, label="measured (filtered)")
-    if len(d["t_des"]):
-        ax[0].step(d["t_des"], d["f_des"], where="post", color="r", ls="--", lw=1.0, label="target f_des")
+    for s in (+1, -1):
+        ax[0].axhline(
+            s * args.f_max, color="r", ls="--", lw=1.0,
+            label="±f_max (box constraint)" if s == 1 else None,
+        )
+    if len(d["t_des"]) and np.any(np.abs(d["f_des"]) > 1e-6):
+        # only relevant on old setpoint-tracking bags — this design has f_des≡0
+        ax[0].step(d["t_des"], d["f_des"], where="post", color="0.4", ls=":", lw=1.0, label="f_des (legacy)")
     ax[0].set_ylabel("f_z  (N)")
     ax[0].legend(loc="upper left")
     ax[0].set_title(

@@ -91,14 +91,19 @@ W_FRAME_ROT = np.array(_w["w_frame_rot"])
 
 _c = _cfg["contact"]
 FORCE_FRAME_ID = _c["frame_id"]
-CONTACT_FORCE_N = _c["force_n"]
-CONTACT_FORCE_RATE = _c["force_rate_n_per_s"]
-CONTACT_HOLD_S = _c["hold_s"]
-# Weights active only during the contact-hold phase (override the global
-# `weights:` block for that phase). See hpp_orchestrator_params.yaml's
-# `contact:` section for the rationale — both were hardcoded here before.
-CONTACT_HOLD_W_FRAME_TRANS = np.array(_c["w_frame_trans"])
-CONTACT_FORCE_W = _c["w_force_z"]
+# Guarded-move press (see hpp_orchestrator_params.yaml `contact:` and
+# _append_press()). The force ceiling itself lives in ocp_definition_file.yaml
+# (running_model.force_ub) — nothing here sets a force target.
+PRESS_DEPTH = _c["press_depth_m"]
+PRESS_RAMP_S = _c["press_ramp_s"]
+PRESS_HOLD_S = _c["press_hold_s"]
+W_FORCE_MARKER = _c["w_force_marker"]
+# The ONE press-specific weight (p1/p2/p3/p4 all keep weights.w_frame_trans).
+# The tiago_pro_force_mpc_sim MuJoCo testbed showed a clean guarded-move
+# push needs a much softer translation weight than the 1000 used for
+# free-space tracking — a stiff one slams the wall on contact. Applied on
+# all 3 axes during the press only.
+PRESS_W_FRAME_TRANS = np.full(3, _c["press_w_frame_trans"])
 
 # ── Optional rosbag recording around execute() ───────────────────────────────
 # Opt in per-call with execute(record=True) (or record="sometag"), or set
@@ -800,12 +805,27 @@ class Orchestrator:
         return self._pin_data.oMf[self._ee_frame_id].copy()
 
     def _build_msg(
-        self, q, dq, ddq, msg_id, force_z: float = 0.0, w_frame_trans=None
+        self, q, dq, ddq, msg_id, ee_pos_target=None, contact_active: bool = False
     ):
-        """w_frame_trans: override for the EE translation weight (position
-        x/y/z of gripper_right_tool_holder), defaults to W_FRAME_TRANS.
-        Orientation weight (W_FRAME_ROT) is never overridden — see
-        _append_contact_hold()."""
+        """Build one MpcInput.
+
+        p1/p2/p3/p4 motion all use the global `weights:` block. The press is
+        the only exception, and only in two ways (both via contact_active):
+        a softer translation weight (PRESS_W_FRAME_TRANS) and the w_force
+        marker below.
+
+        ee_pos_target : world-frame xyz to command for gripper_right_tool_holder
+                        instead of its FK position — used by _append_press() to
+                        push the target past the surface. Orientation always
+                        comes from FK(q).
+        contact_active: during the press only. (1) swaps the translation
+                        weight to PRESS_W_FRAME_TRANS; (2) sets a tiny w_force
+                        on tool z (W_FORCE_MARKER, f_des stays 0) whose sole
+                        effect is to switch on the soft-contact dynamics for
+                        those nodes (dam.active_contact) so the |f| box
+                        constraint (ocp_definition_file.yaml
+                        running_model.force_ub) is live. NOT a force cost.
+        """
         msg = MpcInput()
         msg.id = msg_id
         msg.q = q.tolist()
@@ -820,25 +840,23 @@ class Orchestrator:
 
         T_ee = self._fk_ee(q)
         quat = pin.Quaternion(T_ee.rotation)
+        p = T_ee.translation if ee_pos_target is None else ee_pos_target
         ee_input = MpcEEInput()
         ee_input.frame_id = "gripper_right_tool_holder"
-        ee_input.pose.position.x = float(T_ee.translation[0])
-        ee_input.pose.position.y = float(T_ee.translation[1])
-        ee_input.pose.position.z = float(T_ee.translation[2])
+        ee_input.pose.position.x = float(p[0])
+        ee_input.pose.position.y = float(p[1])
+        ee_input.pose.position.z = float(p[2])
         ee_input.pose.orientation.x = float(quat.x)
         ee_input.pose.orientation.y = float(quat.y)
         ee_input.pose.orientation.z = float(quat.z)
         ee_input.pose.orientation.w = float(quat.w)
-        trans_w = W_FRAME_TRANS if w_frame_trans is None else w_frame_trans
+        trans_w = PRESS_W_FRAME_TRANS if contact_active else W_FRAME_TRANS
         ee_input.w_pose = list(np.concatenate([trans_w, W_FRAME_ROT]))
 
         # Force-feedback OCP (DAMSoftContactAugmentedFwdDynamics) requires every
-        # reference point to carry a forces[frame_id] entry for its contact frame,
-        # even when no force tracking is desired (ocp_croco_generic_force_feedback.py
-        # asserts the key exists) — see project_demo07_force_feedback_scoping memory.
-        # force_z == 0.0 (p1/p2/p3/p4, everywhere but the contact hold) keeps
-        # w_force at all zeros: the force cost stays inactive
-        # (dam.active_contact == False), same as before this was wired up.
+        # reference point to carry a forces[frame_id] entry for its contact frame
+        # (ocp_croco_generic_force_feedback.py asserts the key exists). f_des
+        # stays 0 everywhere — there is no force setpoint in this design.
         force_input = MpcEEInput()
         force_input.frame_id = FORCE_FRAME_ID
         # No pose-tracking cost reads this frame's pose (w_pose stays 0), but
@@ -846,81 +864,60 @@ class Orchestrator:
         # entry unconditionally — give it a valid unit quaternion rather than
         # the message default (0,0,0,0), which is degenerate.
         force_input.pose.orientation.w = 1.0
-        if force_z != 0.0:
-            force_input.force.force.z = float(force_z)
-            # z only — matches enabled_directions: [false, false, true] in
-            # ocp_definition_file.yaml (1D contact along the tool's local z).
-            # Weight from hpp_orchestrator_params.yaml `contact.w_force_z`.
-            force_input.w_force = [0.0, 0.0, CONTACT_FORCE_W, 0.0, 0.0, 0.0]
+        if contact_active:
+            # tool-z only — matches enabled_directions [false, false, true].
+            force_input.w_force = [0.0, 0.0, W_FORCE_MARKER, 0.0, 0.0, 0.0]
 
         msg.ee_inputs = [ee_input, force_input]
         return msg
 
-    def _append_contact_hold(self, msgs: list, idx: int) -> int:
-        """Ramp force 0 -> CONTACT_FORCE_N -> 0 while holding the last
-        configuration in `msgs` — inserted right after the insertion path
-        (p2), before retraction (p3) starts. Values from
-        hpp_orchestrator_params.yaml's `contact:` section, reused as-is from
-        Franka's metal deburring config. NOT tuned for TIAGo Pro — see
-        project_demo07_force_feedback_scoping memory."""
+    def _append_press(self, msgs: list, idx: int) -> int:
+        """Guarded move, inserted right after p2 (insertion), before p3.
+
+        Holds q at qg and marches the tool's Cartesian TARGET
+        PRESS_DEPTH past the nominal surface along the same direction p2
+        approached (world frame), ramp in over PRESS_RAMP_S, dwell
+        PRESS_HOLD_S, ramp back out. Same cost weights as every other phase.
+        How hard the tool actually pushes is capped by the |f| box
+        constraint (ocp_definition_file.yaml running_model.force_ub), not by
+        anything here. Without a wall the tool just reaches the offset target
+        and stops — bounded, no runaway."""
         q_final = np.array(msgs[-1].q)
         dq_zero = np.zeros(len(msgs[-1].qdot))
         ddq_zero = np.zeros(len(msgs[-1].qddot))
 
-        ramp_n = max(1, round(CONTACT_FORCE_N / CONTACT_FORCE_RATE / DT))
-        dwell_n = max(1, round(CONTACT_HOLD_S / DT))
-        profile = np.concatenate(
+        p_hole = self._fk_ee(q_final).translation
+        if self.qpg is None:
+            raise RuntimeError("_append_press needs self.qpg — run plan() first.")
+        p_pregrasp = self._fk_ee(self._extract_active_q(self.qpg)).translation
+        approach = p_hole - p_pregrasp
+        n = np.linalg.norm(approach)
+        if n < 1e-6:
+            raise RuntimeError("p2 approach vector is ~zero — cannot press.")
+        press_dir = approach / n  # world frame, same way p2 came in — no sign guess
+
+        ramp_n = max(1, round(PRESS_RAMP_S / DT))
+        hold_n = max(1, round(PRESS_HOLD_S / DT))
+        depths = np.concatenate(
             [
-                np.linspace(0.0, CONTACT_FORCE_N, ramp_n, endpoint=False),
-                np.full(dwell_n, CONTACT_FORCE_N),
-                np.linspace(CONTACT_FORCE_N, 0.0, ramp_n, endpoint=False),
+                np.linspace(0.0, PRESS_DEPTH, ramp_n, endpoint=False),
+                np.full(hold_n, PRESS_DEPTH),
+                np.linspace(PRESS_DEPTH, 0.0, ramp_n, endpoint=False),
             ]
         )
         print(
-            f"  contact hold: {len(profile)} waypoints "
-            f"({ramp_n} ramp up, {dwell_n} dwell @ {CONTACT_FORCE_N}N, {ramp_n} ramp down)"
+            f"  press: dir(world) ~{np.round(press_dir, 2)}, depth {PRESS_DEPTH * 1e3:.0f} mm, "
+            f"{len(depths)} waypoints ({ramp_n} in, {hold_n} hold, {ramp_n} out)"
         )
-        # Translation weight during the hold — hpp_orchestrator_params.yaml's
-        # `contact.w_frame_trans`, with the push direction masked out (as the
-        # tiago_pro_force_mpc_sim MuJoCo testbed does, ocp.py:
-        #   trans_w = translation_weight * (1 - |push_axis|)  ).
-        # Along the push axis the force cost alone should set the advance; a
-        # non-zero translation weight there fights it (the "sharp,
-        # non-monotone weights" landscape in that project's NOTES.md).
-        #
-        # The testbed mask is binary ([1,0,0] -> [0,1,1]) because its wall is
-        # world-axis-aligned. Here the push is the tool's LOCAL z
-        # (enabled_directions [f,f,t], ref: LOCAL) while
-        # ResidualModelFrameTranslation's residual is WORLD-frame xyz, so the
-        # world push axis is R_world_tool @ z_hat — a general direction — and
-        # the mask is fractional. q_final is frozen for the whole hold, so
-        # compute it once. abs(): the ±z sign of the push (see the URDF
-        # tool-mount comment in _setup_model vs the +z in ocp_definition_file)
-        # is irrelevant for masking an axis.
-        # Orientation weight (W_FRAME_ROT) is left untouched — the tool
-        # shouldn't tip over while pushing.
-        R_world_tool = self._fk_ee(q_final).rotation
-        push_world = np.abs(R_world_tool @ np.array([0.0, 0.0, 1.0]))
-        hold_trans_weight = CONTACT_HOLD_W_FRAME_TRANS * (1.0 - push_world)
-        print(
-            f"  contact hold: push axis (world) ~{np.round(push_world, 2)} -> "
-            f"w_frame_trans {np.round(CONTACT_HOLD_W_FRAME_TRANS, 0)} "
-            f"masked to {np.round(hold_trans_weight, 1)}"
-        )
-        for f in profile:
-            # Sign confirmed empirically on TIAGo Pro (2026-08-21, Clément):
-            # pushing the tool forward along its own axis reads POSITIVE
-            # force.z on /sensor_with_force — opposite of Franka's
-            # `f.linear[2] = -force` convention (metal_deburring_trajectory.py),
-            # which doesn't transfer (different sensor/frame mounting).
+        for d in depths:
             msgs.append(
                 self._build_msg(
                     q_final,
                     dq_zero,
                     ddq_zero,
                     idx,
-                    force_z=float(f),
-                    w_frame_trans=hold_trans_weight,
+                    ee_pos_target=p_hole + d * press_dir,
+                    contact_active=True,
                 )
             )
             idx += 1
@@ -940,7 +937,7 @@ class Orchestrator:
                 msgs.append(self._build_msg(q, dq, ddq, idx))
                 idx += 1
             if "insertion" in label:
-                idx = self._append_contact_hold(msgs, idx)
+                idx = self._append_press(msgs, idx)
         q_final = msgs[-1].q
         dq_zero = np.zeros(len(msgs[-1].qdot)).tolist()
         ddq_zero = np.zeros(len(msgs[-1].qddot)).tolist()

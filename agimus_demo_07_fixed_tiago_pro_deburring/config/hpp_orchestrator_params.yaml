@@ -30,44 +30,27 @@ weights:
   w_frame_trans: [1000.0, 1000.0, 1000.0]                               # task priority
   w_frame_rot: [500.0, 500.0, 500.0]
 
-# ── Insertion contact force profile ─────────────────────────────────────────
-# Applied between the p2 (insertion) and p3 (retraction) paths: ramp
-# force_n/force_rate_n_per_s up, dwell hold_s at force_n, ramp back down —
-# see orchestrator.py's _build_messages()/_append_contact_hold().
-# force_rate_n_per_s set so the ramp duration matches force_ramp_time≈1.0s
-# from the tiago_pro_force_mpc_sim MuJoCo testbed (that project's cleanest,
-# spike-free result) rather than Franka's ~100N/s placeholder. force_n=20N:
-# between the original cautious first-contact value (5N, sign/Kp/Kv/Kv=300
-# switch not yet tested together on the real robot at all) and the
-# testbed's own validated target (50N) — a middle step, not the final
-# value. Raise once this is confirmed stable and safe on the real robot.
-# The sign convention (orchestrator.py) was confirmed empirically on
-# TIAGo Pro 2026-08-21 (opposite Franka's, see orchestrator.py comment) —
-# Kp/Kv (now Kv=300, see ocp_definition_file.yaml) still not re-verified on
-# real contact. See project_demo07_force_feedback_scoping memory.
+# ── Insertion press (guarded move) ──────────────────────────────────────────
+# After p2 reaches the nominal hole, orchestrator.py's _append_press()
+# marches the tool's Cartesian TARGET press_depth_m further along the same
+# direction p2 approached (world frame, derived from FK(qg) - FK(qpg) — no
+# sign guess), ramps in over press_ramp_s, dwells press_hold_s, ramps back
+# out. Cost WEIGHTS are unchanged from every other phase (the global
+# `weights:` block) — the only phase-specific thing is the target offset.
+#
+# How hard the tool ends up pushing is NOT set here: it is capped by the
+# |f| box constraint in ocp_definition_file.yaml (running_model.force_ub).
+# Force acts as a ceiling, not a setpoint. Without a wall the tool just
+# reaches the press_depth_m offset target and stops (bounded, no runaway).
+#
+# w_force_marker: a tiny w_force on the tool z, applied ONLY during the
+# press, whose sole job is to switch the soft-contact dynamics on for those
+# nodes (dam.active_contact) so the force state evolves and the box
+# constraint bites. f_des stays 0 -> the cost contribution is ~nil; it is
+# NOT a force-tracking cost.
 contact:
   frame_id: wrist_right_ft_sensor_link
-  force_n: 20.0              # target insertion contact force (N), tool z axis
-  force_rate_n_per_s: 20.0   # ramp rate, up and down — force_n / force_ramp_time (1.0s)
-  hold_s: 3.0               # dwell time at full force
-  # Cost weights that apply ONLY during the contact-hold phase (they
-  # override the global `weights:` block above for that phase only; p1/p2/
-  # p3/p4 motion is unaffected). Both were hardcoded in orchestrator.py
-  # before — see _append_contact_hold() / _build_msg().
-  # w_frame_trans: tool-tip translation tracking during the hold. Dropped
-  #   from weights.w_frame_trans (1000) to 150 so the force cost can shape
-  #   the push — the tiago_pro_force_mpc_sim MuJoCo testbed found a non-zero
-  #   150 (from Franka's insert_retract_tool profile) part of its clean,
-  #   spike-free result; a full-zero hold was never validated there.
-  #   These 3 values are the UNMASKED weight — orchestrator.py's
-  #   _append_contact_hold() then zeroes the push-direction component
-  #   (w * (1 - |R_world_tool @ z_hat|)), matching the testbed's
-  #   trans_w = w * (1 - |push_axis|), so translation tracking never fights
-  #   the force cost along the advance direction.
-  # w_force_z: force-tracking weight on the tool's local z (1D contact,
-  #   enabled_directions [f,f,t] in ocp_definition_file.yaml). 0.015 reused
-  #   from Franka's deburring_motion.w_desired_force (shared code path,
-  #   ocp_croco_generic_force_feedback.py) — grounded, not a validated
-  #   TIAGo value.
-  w_frame_trans: [150.0, 150.0, 150.0]
-  w_force_z: 0.015
+  press_depth_m: 0.02      # how far past the nominal surface to command the target
+  press_ramp_s: 1.5        # ramp the target offset in, and back out, over this
+  press_hold_s: 3.0        # dwell at full press_depth_m
+  w_force_marker: 1.0e-4   # tiny w_force during the press to enable active_contact
