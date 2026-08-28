@@ -142,11 +142,22 @@ class _TrajectoryPublisherNode(Node):
         )
         self._done = False
 
+    def restart(self, messages: list) -> None:
+        """Re-arm for a fresh execute() on a reused node."""
+        self._messages = messages
+        self._idx = 0
+        self._t_start = None
+        self._done = False
+        self._timer = self.create_timer(DT / 4.0, self._publish_next)
+
     def _publish_next(self):
         if self._t_start is None:
             self._t_start = time.monotonic()
         target = int((time.monotonic() - self._t_start) / DT) + 1
-        while self._idx < min(target, len(self._messages)):
+        # Cap the burst: even if the clock is off, ramp in over a few ticks
+        # rather than dumping the whole trajectory into the MPC buffer.
+        stop = min(target, self._idx + 8, len(self._messages))
+        while self._idx < stop:
             self._pub.publish(self._messages[self._idx])
             self._idx += 1
         if self._idx >= len(self._messages):
@@ -1029,12 +1040,7 @@ class Orchestrator:
         if self._ros_node is None:
             self._ros_node = _TrajectoryPublisherNode(self._messages)
         else:
-            self._ros_node._messages = self._messages
-            self._ros_node._idx = 0
-            self._ros_node._done = False
-            self._ros_node._timer = self._ros_node.create_timer(
-                DT, self._ros_node._publish_next
-            )
+            self._ros_node.restart(self._messages)
 
         do_record = self.record if record is None else record
         tag = do_record if isinstance(do_record, str) else ""
