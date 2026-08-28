@@ -123,6 +123,11 @@ class ContactDetector:
         self._in_contact = False
         self._samples_since_switch = 0
 
+    def reset(self) -> None:
+        self._last_in_contact = False
+        self._in_contact = False
+        self._samples_since_switch = 0
+
     def update(self, force_linear: np.ndarray) -> bool:
         thresh = self._lower if self._last_in_contact else self._upper
         self._in_contact = float(np.linalg.norm(force_linear * self._mask)) > thresh
@@ -176,6 +181,12 @@ class ForceSensorFilterNode(Node):
         self.declare_parameter("contact_lower_threshold", 4.0)
         self.declare_parameter("contact_upper_threshold", 6.0)
         self.declare_parameter("contact_hysteresis_samples", 5)
+        # Quasi-static gate: the gravity model has NO inertial term, so
+        # accelerating the arm (the tool CoM hangs off the wrist) produces a
+        # transient f_z that crosses the threshold — a false contact. Only
+        # trust the detector when ‖qdot‖ is below this (rad/s); a guarded-move
+        # contact arrives slow anyway. 0.0 disables the gate.
+        self.declare_parameter("contact_max_qdot", 0.2)
 
         p = self.get_parameter
         self._measurement_frame = p("measurement_frame_id").value
@@ -198,6 +209,8 @@ class ForceSensorFilterNode(Node):
             p("contact_upper_threshold").value,
             p("contact_hysteresis_samples").value,
         )
+        self._contact_max_qdot = p("contact_max_qdot").value
+        self._latest_qdot: float | None = None  # ‖qdot‖ from the last Sensor msg
 
         if self._com_mass == 0.0:
             self.get_logger().warn(
@@ -349,11 +362,25 @@ class ForceSensorFilterNode(Node):
         f_out = raw - self._bias - f_gravity
         f_out = np.array([flt.update(v) for flt, v in zip(self._filters, f_out)])
         self._filtered_wrench = f_out
-        self._in_contact = self._contact_detector.update(f_out[:3])
+        # Quasi-static gate — see contact_max_qdot. While the arm moves fast,
+        # the (inertia-free) f_out is unreliable: hold the detector reset and
+        # report no contact. The wrench itself is still published.
+        moving = (
+            self._contact_max_qdot > 0.0
+            and self._latest_qdot is not None
+            and self._latest_qdot > self._contact_max_qdot
+        )
+        if moving:
+            self._contact_detector.reset()
+            self._in_contact = False
+        else:
+            self._in_contact = self._contact_detector.update(f_out[:3])
 
     # ── Sensor augmentation ─────────────────────────────────────────────────
 
     def _sensor_cb(self, msg: Sensor) -> None:
+        if len(msg.joint_state.velocity):
+            self._latest_qdot = float(np.linalg.norm(msg.joint_state.velocity))
         if self._filtered_wrench is not None:
             w = self._filtered_wrench
             msg.contacts = list(msg.contacts) + [
