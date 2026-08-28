@@ -871,17 +871,21 @@ class Orchestrator:
         msg.ee_inputs = [ee_input, force_input]
         return msg
 
-    def _append_press(self, msgs: list, idx: int) -> int:
-        """Guarded move, inserted right after p2 (insertion), before p3.
+    # Force involvement in the press is deferred (bag 20260827_151542 diverged
+    # — see ocp_definition_file.yaml comment). This iteration tests the press
+    # as PURE MOTION: contact_active=False everywhere, no w_force marker, no
+    # box constraint, uniform weights (W_FRAME_TRANS) — just to see whether
+    # the Cartesian target march itself is stable at the new horizon.
+    PRESS_PURE_MOTION = True
 
-        Holds q at qg and marches the tool's Cartesian TARGET
-        PRESS_DEPTH past the nominal surface along the same direction p2
-        approached (world frame), ramp in over PRESS_RAMP_S, dwell
-        PRESS_HOLD_S, ramp back out. Same cost weights as every other phase.
-        How hard the tool actually pushes is capped by the |f| box
-        constraint (ocp_definition_file.yaml running_model.force_ub), not by
-        anything here. Without a wall the tool just reaches the offset target
-        and stops — bounded, no runaway."""
+    def _append_press(self, msgs: list, idx: int) -> int:
+        """Inserted right after p2 (insertion), before p3.
+
+        Holds q at qg and marches the tool's Cartesian TARGET PRESS_DEPTH
+        past the nominal surface along the direction p2 approached (world
+        frame), ramp in over PRESS_RAMP_S, dwell PRESS_HOLD_S, ramp back out.
+        With PRESS_PURE_MOTION the cost weights are the global ones and there
+        is no force handling at all."""
         q_final = np.array(msgs[-1].q)
         dq_zero = np.zeros(len(msgs[-1].qdot))
         ddq_zero = np.zeros(len(msgs[-1].qddot))
@@ -906,7 +910,8 @@ class Orchestrator:
             ]
         )
         print(
-            f"  press: dir(world) ~{np.round(press_dir, 2)}, depth {PRESS_DEPTH * 1e3:.0f} mm, "
+            f"  press: {'PURE MOTION' if self.PRESS_PURE_MOTION else 'contact'}, "
+            f"dir(world) ~{np.round(press_dir, 2)}, depth {PRESS_DEPTH * 1e3:.0f} mm, "
             f"{len(depths)} waypoints ({ramp_n} in, {hold_n} hold, {ramp_n} out)"
         )
         for d in depths:
@@ -917,7 +922,7 @@ class Orchestrator:
                     ddq_zero,
                     idx,
                     ee_pos_target=p_hole + d * press_dir,
-                    contact_active=True,
+                    contact_active=not self.PRESS_PURE_MOTION,
                 )
             )
             idx += 1

@@ -4,18 +4,14 @@
 
 running_model:
   class: IAMSoftContactAugmented
-  # Hard box constraint on the augmented contact force, |f| within
-  # [force_lb, force_ub] (N, tool z), enforced by SolverCSQP every solve.
-  # This is the force CEILING for the guarded-move press (orchestrator.py's
-  # _append_press): p2 commands the tool past the surface, this caps how
-  # hard it may push. There is no force setpoint / force-tracking cost.
-  # Symmetric bounds = |f| <= 20 N regardless of the contact sign convention
-  # (which was "opposite Franka's", confirmed on robot 2026-08-21).
-  # NB: it bounds the *predicted* force under an approximate contact model
-  # (Kp/Kv) — real force can transiently overshoot before the MPC reacts;
-  # keep margin below anything actually dangerous.
-  force_lb: [-20.0]
-  force_ub: [20.0]
+  # Force box constraint (force_lb/force_ub) REMOVED for this iteration.
+  # Bag 20260827_151542: when active_contact went False at the press->hold
+  # transition, `f` becomes uncontrollable (fdot=0) but the constraint
+  # `calc` still evaluates |f| <= f_max against x0.f from the noisy real
+  # sensor — a spike past 20 N is then an infeasibility SolverCSQP cannot
+  # fix, and it diverged (|u| -> 6400 N.m). Re-add only once (a) it's gated
+  # on active_contact and (b) x0.f is filtered/clamped when there's no
+  # confirmed contact. Testing the press as pure motion first.
   differential:
     class: DAMSoftContactAugmentedFwdDynamics
     # Soft contact model. Kp=9000/Kv=300 (not Franka's placeholders
@@ -99,9 +95,7 @@ running_model:
 
 terminal_model:
   class: IAMSoftContactAugmented
-  # See running_model.force_lb/force_ub.
-  force_lb: [-20.0]
-  force_ub: [20.0]
+  # Force box constraint removed — see running_model.
   differential:
     class: DAMSoftContactAugmentedFwdDynamics
     # See running_model.differential — sized to 1, not 3 (1D contact).

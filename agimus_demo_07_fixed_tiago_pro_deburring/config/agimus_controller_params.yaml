@@ -10,9 +10,14 @@ agimus_controller_node:
     collision_as_capsule: true
     ocp:
       dt: 0.01
-      horizon_size: 50
+      # 50 -> 30: the force-feedback run (bag 20260827_151542) solved in
+      # ~13 ms mean / 34 ms max, 76% over the 10 ms budget @ 100 Hz — the
+      # trajectory played back at ~50 Hz and control lagged. 30 nodes
+      # (0.3 s lookahead) to get back under budget. Revisit once the
+      # contact scheme is settled.
+      horizon_size: 30
       dt_factor_n_seq:
-        n_steps: [50]
+        n_steps: [30]
         factors: [1]
       armature: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
       max_qp_iter: 50
