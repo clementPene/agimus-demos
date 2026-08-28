@@ -91,19 +91,15 @@ W_FRAME_ROT = np.array(_w["w_frame_rot"])
 
 _c = _cfg["contact"]
 FORCE_FRAME_ID = _c["frame_id"]
-# Guarded-move press (see hpp_orchestrator_params.yaml `contact:` and
-# _append_press()). The force ceiling itself lives in ocp_definition_file.yaml
-# (running_model.force_ub) — nothing here sets a force target.
+# Deep insert (see hpp_orchestrator_params.yaml `contact:` and
+# _append_deep_insert()): after p2, continue the tool PRESS_DEPTH into the
+# part via a joint-space ramp to an IK-solved qg_deep. Force handling is
+# deferred — w_force_marker / press_w_frame_trans in the yaml are unused
+# this iteration.
 PRESS_DEPTH = _c["press_depth_m"]
 PRESS_RAMP_S = _c["press_ramp_s"]
 PRESS_HOLD_S = _c["press_hold_s"]
-W_FORCE_MARKER = _c["w_force_marker"]
-# The ONE press-specific weight (p1/p2/p3/p4 all keep weights.w_frame_trans).
-# The tiago_pro_force_mpc_sim MuJoCo testbed showed a clean guarded-move
-# push needs a much softer translation weight than the 1000 used for
-# free-space tracking — a stiff one slams the wall on contact. Applied on
-# all 3 axes during the press only.
-PRESS_W_FRAME_TRANS = np.full(3, _c.get("press_w_frame_trans", 60.0))
+POST_P2_HOLD_S = _c.get("post_p2_hold_s", 0.0)  # dwell at qg before pushing deeper
 
 # ── Optional rosbag recording around execute() ───────────────────────────────
 # Opt in per-call with execute(record=True) (or record="sometag"), or set
@@ -134,23 +130,30 @@ class _TrajectoryPublisherNode(Node):
         super().__init__("hpp_trajectory_publisher")
         self._messages = messages
         self._idx = 0
+        self._t_start = None
         qos = QoSProfile(depth=1000, reliability=ReliabilityPolicy.BEST_EFFORT)
         self._pub = self.create_publisher(MpcInput, "mpc_input", qos)
-        self._timer = self.create_timer(DT, self._publish_next)
+        # Fire faster than DT; _publish_next catches up to wall-clock so the
+        # trajectory always plays at 1/DT regardless of timer/executor jitter
+        # (the old DT timer + a sleep(DT) in execute() halved the real rate).
+        self._timer = self.create_timer(DT / 4.0, self._publish_next)
         self.get_logger().info(
             f"Publishing {len(self._messages)} trajectory points at {1 / DT:.0f} Hz …"
         )
         self._done = False
 
     def _publish_next(self):
+        if self._t_start is None:
+            self._t_start = time.monotonic()
+        target = int((time.monotonic() - self._t_start) / DT) + 1
+        while self._idx < min(target, len(self._messages)):
+            self._pub.publish(self._messages[self._idx])
+            self._idx += 1
         if self._idx >= len(self._messages):
             if not self._done:
                 self.get_logger().info("Trajectory fully published.")
                 self._done = True
             self._timer.cancel()
-            return
-        self._pub.publish(self._messages[self._idx])
-        self._idx += 1
 
 
 class Orchestrator:
@@ -804,28 +807,42 @@ class Orchestrator:
         pin.updateFramePlacements(self.model, self._pin_data)
         return self._pin_data.oMf[self._ee_frame_id].copy()
 
-    def _build_msg(
-        self, q, dq, ddq, msg_id, ee_pos_target=None, contact_active: bool = False
-    ):
-        """Build one MpcInput.
+    def _ik_ee(
+        self, T_target: pin.SE3, q_seed: np.ndarray, iters: int = 60, tol: float = 1e-5
+    ) -> np.ndarray:
+        """Damped least-squares IK for the 7 right-arm joints placing
+        _ee_frame_id at T_target. q_seed / return are the 7 arm values. Used
+        for a tiny (~cm) perturbation of a known config — converges fast."""
+        q_full = pin.neutral(self.model)
+        ri = self._right_arm_idx  # config (nq) index
+        vi = self.model.joints[
+            self.model.getJointId("tiago_pro/arm_right_1_joint")
+        ].idx_v  # velocity (nv) index — differs from ri if a multi-dof joint (pylone
+        #          free-flyer) precedes the arm in the model
+        q_lo = self.model.lowerPositionLimit[ri : ri + 7]
+        q_hi = self.model.upperPositionLimit[ri : ri + 7]
+        q = np.clip(np.array(q_seed, dtype=float), q_lo, q_hi)
+        for _ in range(iters):
+            q_full[ri : ri + 7] = q
+            pin.forwardKinematics(self.model, self._pin_data, q_full)
+            pin.updateFramePlacements(self.model, self._pin_data)
+            T_cur = self._pin_data.oMf[self._ee_frame_id]
+            err = pin.log6(T_cur.actInv(T_target)).vector  # 6, LOCAL to T_cur
+            if np.linalg.norm(err) < tol:
+                break
+            J = pin.computeFrameJacobian(
+                self.model, self._pin_data, q_full, self._ee_frame_id, pin.LOCAL
+            )[:, vi : vi + 7]
+            q = np.clip(
+                q + np.linalg.solve(J.T @ J + 1e-6 * np.eye(7), J.T @ err), q_lo, q_hi
+            )
+        return q
 
-        p1/p2/p3/p4 motion all use the global `weights:` block. The press is
-        the only exception, and only in two ways (both via contact_active):
-        a softer translation weight (PRESS_W_FRAME_TRANS) and the w_force
-        marker below.
-
-        ee_pos_target : world-frame xyz to command for gripper_right_tool_holder
-                        instead of its FK position — used by _append_press() to
-                        push the target past the surface. Orientation always
-                        comes from FK(q).
-        contact_active: during the press only. (1) swaps the translation
-                        weight to PRESS_W_FRAME_TRANS; (2) sets a tiny w_force
-                        on tool z (W_FORCE_MARKER, f_des stays 0) whose sole
-                        effect is to switch on the soft-contact dynamics for
-                        those nodes (dam.active_contact) so the |f| box
-                        constraint (ocp_definition_file.yaml
-                        running_model.force_ub) is live. NOT a force cost.
-        """
+    def _build_msg(self, q, dq, ddq, msg_id):
+        """Build one MpcInput. Cost weights are the global `weights:` block —
+        the SAME for every waypoint of every phase (p1/p2/p3/p4 and the deep
+        insert). The tool-tip target is always FK(q), so the joint-space
+        reference and the Cartesian target are always consistent."""
         msg = MpcInput()
         msg.id = msg_id
         msg.q = q.tolist()
@@ -840,91 +857,80 @@ class Orchestrator:
 
         T_ee = self._fk_ee(q)
         quat = pin.Quaternion(T_ee.rotation)
-        p = T_ee.translation if ee_pos_target is None else ee_pos_target
         ee_input = MpcEEInput()
         ee_input.frame_id = "gripper_right_tool_holder"
-        ee_input.pose.position.x = float(p[0])
-        ee_input.pose.position.y = float(p[1])
-        ee_input.pose.position.z = float(p[2])
+        ee_input.pose.position.x = float(T_ee.translation[0])
+        ee_input.pose.position.y = float(T_ee.translation[1])
+        ee_input.pose.position.z = float(T_ee.translation[2])
         ee_input.pose.orientation.x = float(quat.x)
         ee_input.pose.orientation.y = float(quat.y)
         ee_input.pose.orientation.z = float(quat.z)
         ee_input.pose.orientation.w = float(quat.w)
-        trans_w = PRESS_W_FRAME_TRANS if contact_active else W_FRAME_TRANS
-        ee_input.w_pose = list(np.concatenate([trans_w, W_FRAME_ROT]))
+        ee_input.w_pose = list(np.concatenate([W_FRAME_TRANS, W_FRAME_ROT]))
 
-        # Force-feedback OCP (DAMSoftContactAugmentedFwdDynamics) requires every
-        # reference point to carry a forces[frame_id] entry for its contact frame
-        # (ocp_croco_generic_force_feedback.py asserts the key exists). f_des
-        # stays 0 everywhere — there is no force setpoint in this design.
+        # DAMSoftContactAugmentedFwdDynamics.update() asserts forces[frame_id]
+        # exists on every reference point — carry a zero-weight entry for the
+        # contact frame. No force setpoint / cost / constraint in this
+        # iteration (see ocp_definition_file.yaml comment).
         force_input = MpcEEInput()
         force_input.frame_id = FORCE_FRAME_ID
-        # No pose-tracking cost reads this frame's pose (w_pose stays 0), but
-        # mocap_mpc_corrector.py applies its SE3 correction to every ee_inputs
-        # entry unconditionally — give it a valid unit quaternion rather than
-        # the message default (0,0,0,0), which is degenerate.
-        force_input.pose.orientation.w = 1.0
-        if contact_active:
-            # tool-z only — matches enabled_directions [false, false, true].
-            force_input.w_force = [0.0, 0.0, W_FORCE_MARKER, 0.0, 0.0, 0.0]
-
+        force_input.pose.orientation.w = 1.0  # valid unit quat (mocap_mpc_corrector)
         msg.ee_inputs = [ee_input, force_input]
         return msg
 
-    # Force involvement in the press is deferred (bag 20260827_151542 diverged
-    # — see ocp_definition_file.yaml comment). This iteration tests the press
-    # as PURE MOTION: contact_active=False everywhere, no w_force marker, no
-    # box constraint, uniform weights (W_FRAME_TRANS) — just to see whether
-    # the Cartesian target march itself is stable at the new horizon.
-    PRESS_PURE_MOTION = True
+    def _append_deep_insert(self, msgs: list, idx: int) -> int:
+        """Continue p2 INTO the part: after the insertion path reaches qg
+        (tool on the nominal surface), interpolate q in joint space from qg
+        to qg_deep — the config, IK-solved, that puts the tool PRESS_DEPTH
+        further along the approach direction. Ramp in over PRESS_RAMP_S,
+        dwell PRESS_HOLD_S, ramp back to qg.
 
-    def _append_press(self, msgs: list, idx: int) -> int:
-        """Inserted right after p2 (insertion), before p3.
-
-        Holds q at qg and marches the tool's Cartesian TARGET PRESS_DEPTH
-        past the nominal surface along the direction p2 approached (world
-        frame), ramp in over PRESS_RAMP_S, dwell PRESS_HOLD_S, ramp back out.
-        With PRESS_PURE_MOTION the cost weights are the global ones and there
-        is no force handling at all."""
-        q_final = np.array(msgs[-1].q)
-        dq_zero = np.zeros(len(msgs[-1].qdot))
-        ddq_zero = np.zeros(len(msgs[-1].qddot))
-
-        p_hole = self._fk_ee(q_final).translation
+        This replaces the earlier Cartesian-target march: q and the tool
+        target are now always consistent (no state_reg vs frame-tracking
+        tug-of-war), and it's a plain joint-space reference with the SAME
+        cost weights as every other phase. With a wall the real contact
+        stops the arm short of qg_deep — the residual position error is the
+        push. Force handling is deferred (see ocp_definition_file.yaml)."""
+        q_g = np.array(msgs[-1].q)
         if self.qpg is None:
-            raise RuntimeError("_append_press needs self.qpg — run plan() first.")
-        p_pregrasp = self._fk_ee(self._extract_active_q(self.qpg)).translation
-        approach = p_hole - p_pregrasp
+            raise RuntimeError("_append_deep_insert needs self.qpg — run plan().")
+        T_g = self._fk_ee(q_g)
+        p_pre = self._fk_ee(self._extract_active_q(self.qpg)).translation
+        approach = T_g.translation - p_pre
         n = np.linalg.norm(approach)
         if n < 1e-6:
-            raise RuntimeError("p2 approach vector is ~zero — cannot press.")
-        press_dir = approach / n  # world frame, same way p2 came in — no sign guess
+            raise RuntimeError("p2 approach vector is ~zero — cannot deep-insert.")
+        approach /= n  # world frame, the direction p2 came in — no sign guess
+
+        T_deep = pin.SE3(T_g.rotation, T_g.translation + PRESS_DEPTH * approach)
+        q_deep = self._ik_ee(T_deep, q_g)
+        residual = np.linalg.norm(self._fk_ee(q_deep).translation - T_deep.translation)
+        print(
+            f"  deep insert: +{PRESS_DEPTH * 1e3:.0f} mm along {np.round(approach, 2)}, "
+            f"IK residual {residual * 1e3:.2f} mm, "
+            f"joint move {np.round(np.rad2deg(q_deep - q_g), 1)} deg"
+        )
 
         ramp_n = max(1, round(PRESS_RAMP_S / DT))
         hold_n = max(1, round(PRESS_HOLD_S / DT))
-        depths = np.concatenate(
+        pre_n = max(0, round(POST_P2_HOLD_S / DT))
+        alphas = np.concatenate(
             [
-                np.linspace(0.0, PRESS_DEPTH, ramp_n, endpoint=False),
-                np.full(hold_n, PRESS_DEPTH),
-                np.linspace(PRESS_DEPTH, 0.0, ramp_n, endpoint=False),
+                np.zeros(pre_n),  # dwell at qg (p2 done, tool on the surface)
+                np.linspace(0.0, 1.0, ramp_n, endpoint=False),  # push in
+                np.ones(hold_n),  # dwell at qg_deep
+                np.linspace(1.0, 0.0, ramp_n, endpoint=False),  # back to qg
             ]
         )
         print(
-            f"  press: {'PURE MOTION' if self.PRESS_PURE_MOTION else 'contact'}, "
-            f"dir(world) ~{np.round(press_dir, 2)}, depth {PRESS_DEPTH * 1e3:.0f} mm, "
-            f"{len(depths)} waypoints ({ramp_n} in, {hold_n} hold, {ramp_n} out)"
+            f"    schedule: {pre_n} at qg / {ramp_n} in / {hold_n} at qg_deep / "
+            f"{ramp_n} out  = {len(alphas)} wp ({len(alphas) * DT:.1f}s)"
         )
-        for d in depths:
-            msgs.append(
-                self._build_msg(
-                    q_final,
-                    dq_zero,
-                    ddq_zero,
-                    idx,
-                    ee_pos_target=p_hole + d * press_dir,
-                    contact_active=not self.PRESS_PURE_MOTION,
-                )
-            )
+        dq_zero = np.zeros(7)
+        ddq_zero = np.zeros(7)
+        for a in alphas:
+            q_i = q_g + a * (q_deep - q_g)
+            msgs.append(self._build_msg(q_i, dq_zero, ddq_zero, idx))
             idx += 1
         return idx
 
@@ -942,7 +948,7 @@ class Orchestrator:
                 msgs.append(self._build_msg(q, dq, ddq, idx))
                 idx += 1
             if "insertion" in label:
-                idx = self._append_press(msgs, idx)
+                idx = self._append_deep_insert(msgs, idx)
         q_final = msgs[-1].q
         dq_zero = np.zeros(len(msgs[-1].qdot)).tolist()
         ddq_zero = np.zeros(len(msgs[-1].qddot)).tolist()
@@ -1036,9 +1042,11 @@ class Orchestrator:
 
         print("Publishing trajectory …")
         try:
+            # spin_once blocks up to the timeout waiting for the publish timer;
+            # the timer + _publish_next's wall-clock catch-up keep the real
+            # rate at 1/DT. (No extra sleep — that's what halved the rate.)
             while not self._ros_node._done:
-                rclpy.spin_once(self._ros_node, timeout_sec=0.0)
-                time.sleep(DT)
+                rclpy.spin_once(self._ros_node, timeout_sec=DT / 4.0)
         except KeyboardInterrupt:
             print("\nExecution interrupted.")
         finally:

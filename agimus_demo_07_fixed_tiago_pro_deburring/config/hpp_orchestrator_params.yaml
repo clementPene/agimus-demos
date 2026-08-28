@@ -30,33 +30,25 @@ weights:
   w_frame_trans: [1000.0, 1000.0, 1000.0]                               # task priority
   w_frame_rot: [500.0, 500.0, 500.0]
 
-# ── Insertion press (guarded move) ──────────────────────────────────────────
-# After p2 reaches the nominal hole, orchestrator.py's _append_press()
-# marches the tool's Cartesian TARGET press_depth_m further along the same
-# direction p2 approached (world frame, derived from FK(qg) - FK(qpg) — no
-# sign guess), ramps in over press_ramp_s, dwells press_hold_s, ramps back
-# out. Cost WEIGHTS are unchanged from every other phase (the global
-# `weights:` block) — the only phase-specific thing is the target offset.
-#
-# How hard the tool ends up pushing is NOT set here: it is capped by the
-# |f| box constraint in ocp_definition_file.yaml (running_model.force_ub).
-# Force acts as a ceiling, not a setpoint. Without a wall the tool just
-# reaches the press_depth_m offset target and stops (bounded, no runaway).
-#
-# w_force_marker: a tiny w_force on the tool z, applied ONLY during the
-# press, whose sole job is to switch the soft-contact dynamics on for those
-# nodes (dam.active_contact) so the force state evolves and the box
-# constraint bites. f_des stays 0 -> the cost contribution is ~nil; it is
-# NOT a force-tracking cost.
+# ── Deep insert ────────────────────────────────────────────────────────────
+# After p2 reaches the nominal hole (qg), orchestrator.py's
+# _append_deep_insert() continues the tool press_depth_m further INTO the
+# part: IK-solve qg_deep (tool at FK(qg) + press_depth_m along the approach
+# direction, same rotation), then a joint-space ramp qg -> qg_deep -> hold
+# -> qg. Cost WEIGHTS are the global `weights:` block — identical to every
+# other phase; q and the tool target stay consistent.
+# With a wall the real contact stops the arm short of qg_deep. Force
+# handling (constraint / cost, active_contact) is deferred — see the
+# ocp_definition_file.yaml comment. w_force_marker / press_w_frame_trans
+# below are unused this iteration.
 contact:
   frame_id: wrist_right_ft_sensor_link
-  press_depth_m: 0.02      # how far past the nominal surface to command the target
-  press_ramp_s: 1.5        # ramp the target offset in, and back out, over this
-  press_hold_s: 3.0        # dwell at full press_depth_m
-  w_force_marker: 1.0e-4   # tiny w_force during the press to enable active_contact
-  # The ONE press-specific cost weight (p1/p2/p3/p4 keep weights.w_frame_trans
-  # = 1000). The tiago_pro_force_mpc_sim MuJoCo testbed showed a clean
-  # guarded-move push needs a MUCH softer translation weight — pushing a
-  # past-the-wall target at 1000 slams the contact (peak ~70 N vs a 20 N
-  # ceiling); ~60 gave a spike-free push that settled exactly on the cap.
-  press_w_frame_trans: 60.0
+  press_depth_m: 0.05      # how far past the nominal surface. 5cm = clearly
+                           # visible on a no-wall motion check; drop to ~1-2cm
+                           # once a wall + force regulation are back in.
+  press_ramp_s: 1.5        # ramp qg <-> qg_deep over this
+  post_p2_hold_s: 3.0      # dwell at qg (tool on the surface) right after p2,
+                           # before pushing deeper — lets you see p2's endpoint
+  press_hold_s: 5.0        # dwell at qg_deep (tool pushed in)
+  w_force_marker: 1.0e-4   # (unused this iteration) tiny w_force to enable active_contact
+  press_w_frame_trans: 60.0  # (unused this iteration) softer translation weight for a real contact
