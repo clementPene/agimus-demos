@@ -4,14 +4,16 @@
 
 running_model:
   class: IAMSoftContactAugmented
-  # Force box constraint (force_lb/force_ub) REMOVED for this iteration.
-  # Bag 20260827_151542: when active_contact went False at the press->hold
-  # transition, `f` becomes uncontrollable (fdot=0) but the constraint
-  # `calc` still evaluates |f| <= f_max against x0.f from the noisy real
-  # sensor — a spike past 20 N is then an infeasibility SolverCSQP cannot
-  # fix, and it diverged (|u| -> 6400 N.m). Re-add only once (a) it's gated
-  # on active_contact and (b) x0.f is filtered/clamped when there's no
-  # confirmed contact. Testing the press as pure motion first.
+  # |f| box constraint, tool z (N). Re-added 2026-08-28 with the two fixes
+  # the 20260827_151542 divergence needed:
+  #  - GATED: agimus_controller enables it (iam.with_force_constraint) only
+  #    while the sensor reports contact (contact.active, itself quasi-static
+  #    gated). While off, f is frozen/decoupled and unconstrained, so a
+  #    noisy x0.f can't be an unfixable infeasibility.
+  #  - x0.f is hard-clamped (_CONTACT_FORCE_CLAMP_N) before it enters the state.
+  # Low for the first robot test — raise once behaviour is confirmed.
+  force_lb: [-15.0]
+  force_ub: [15.0]
   differential:
     class: DAMSoftContactAugmentedFwdDynamics
     # Soft contact model. Kp=9000/Kv=300 (not Franka's placeholders
@@ -95,7 +97,9 @@ running_model:
 
 terminal_model:
   class: IAMSoftContactAugmented
-  # Force box constraint removed — see running_model.
+  # See running_model — gated |f| box.
+  force_lb: [-15.0]
+  force_ub: [15.0]
   differential:
     class: DAMSoftContactAugmentedFwdDynamics
     # See running_model.differential — sized to 1, not 3 (1D contact).
