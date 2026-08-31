@@ -7,6 +7,7 @@ agimus_controller_node:
   ros__parameters:
     rate: 100.0
     free_flyer: false
+    constant_delay: true
     collision_as_capsule: true
     ocp:
       dt: 0.01
