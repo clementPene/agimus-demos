@@ -22,6 +22,8 @@ Run via orchestrator_node.py (sources both ros2_config.sh and hpp_config.sh).
 """
 
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import glob
@@ -87,6 +89,26 @@ W_COLLISION = _w["w_collision"]
 W_FRAME_TRANS = np.array(_w["w_frame_trans"])
 W_FRAME_ROT = np.array(_w["w_frame_rot"])
 
+# ── Optional rosbag recording around execute() ───────────────────────────────
+# Opt in per-call with execute(record=True) (or record="sometag"), or set
+# o.record = True once for the session. Bags land in <source>/plot/runs/ and
+# feed plot/analyse_mpc_command_delay.py directly — no second terminal.
+#
+# realpath (not _PKG_DIR): `plot/` is NOT in CMakeLists' INSTALL_TO_SHARE, so
+# under --symlink-install the installed orchestrator.py is a symlink back to
+# the source tree — resolving it lands the runs next to the analysis script
+# instead of in an install-space `plot/` that nothing else looks at.
+_SRC_PKG_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+_RUNS_DIR = os.path.join(_SRC_PKG_DIR, "plot", "runs")
+_PLOT_SCRIPT = os.path.join(_SRC_PKG_DIR, "plot", "analyse_mpc_command_delay.py")
+RECORD_TOPICS = [
+    "/sensor",           # 1 kHz robot state published by the LFC
+    "/ocp_x0",           # state actually fed to the solver (post delay prediction)
+    "/control",          # commanded feedforward torque + Riccati gain
+    "/ocp_solve_time",   # OCP solve compute time
+    "/mpc_debug",        # KKT norm, solver iters
+]
+
 
 class _TrajectoryPublisherNode(Node):
     """One-shot ROS2 node that publishes pre-computed MpcInput messages."""
@@ -129,6 +151,9 @@ class Orchestrator:
         self._ros_node = ros_node
         self.p1 = self.p2 = self.p3 = self.p4 = None
         self._messages = None
+        # Set True to auto-record every execute() run (see RECORD_TOPICS /
+        # execute(record=...)). Per-call `record=` overrides this.
+        self.record = False
 
         print("Loading HPP model …")
         self._setup_model()
@@ -817,12 +842,51 @@ class Orchestrator:
 
     # ── Execution ─────────────────────────────────────────────────────────────
 
-    def execute(self, paths=None):
+    def _start_bag(self, tag: str = ""):
+        """Spawn `ros2 bag record` for RECORD_TOPICS, scoped to one execute()
+        call. Best-effort: returns None (and never raises) if `ros2` is
+        missing or the recorder fails to start, so a run is never blocked."""
+        if shutil.which("ros2") is None:
+            print("  record: `ros2` not on PATH — skipping bag.")
+            return None
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        out = os.path.join(_RUNS_DIR, f"{stamp}_{tag}" if tag else stamp)
+        os.makedirs(_RUNS_DIR, exist_ok=True)
+        proc = subprocess.Popen(
+            ["ros2", "bag", "record", "-o", out, *RECORD_TOPICS],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(1.0)  # let discovery + subscriptions settle before publishing
+        if proc.poll() is not None:
+            print("  record: `ros2 bag record` exited immediately — skipping bag.")
+            return None
+        print(f"  record: {out}")
+        return proc, out
+
+    def _stop_bag(self, handle) -> None:
+        if handle is None:
+            return
+        proc, out = handle
+        time.sleep(1.5)  # let the last sensor/control messages land
+        proc.send_signal(signal.SIGINT)  # ros2 bag finalises the DB on SIGINT
+        try:
+            proc.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        print(f"  record: wrote {out}")
+        print(f"  analyse: python3 {_PLOT_SCRIPT} {out}")
+
+    def execute(self, paths=None, record=None):
         """
         Sample and publish MpcInput messages to the controller.
 
-        paths : list of Path objects to execute in sequence.
-                Defaults to [p1, p2, p3, p4].
+        paths  : list of Path objects to execute in sequence.
+                 Defaults to [p1, p2, p3, p4].
+        record : True (or a str tag) wraps the run in a `ros2 bag record` of
+                 RECORD_TOPICS under plot/runs/<timestamp>[_tag]/ — feeds
+                 plot/analyse_mpc_command_delay.py directly, no second terminal.
+                 None (default) falls back to self.record.
         """
         if self.p1 is None:
             print("No path available — run plan() first.")
@@ -851,6 +915,10 @@ class Orchestrator:
                 DT, self._ros_node._publish_next
             )
 
+        do_record = self.record if record is None else record
+        tag = do_record if isinstance(do_record, str) else ""
+        bag = self._start_bag(tag) if do_record else None
+
         print("Publishing trajectory …")
         try:
             while not self._ros_node._done:
@@ -858,6 +926,8 @@ class Orchestrator:
                 time.sleep(DT)
         except KeyboardInterrupt:
             print("\nExecution interrupted.")
+        finally:
+            self._stop_bag(bag)
 
     # ── Pose comparison ───────────────────────────────────────────────────────
 
