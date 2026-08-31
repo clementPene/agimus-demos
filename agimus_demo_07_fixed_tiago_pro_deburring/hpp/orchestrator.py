@@ -102,6 +102,7 @@ _SRC_PKG_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 _RUNS_DIR = os.path.join(_SRC_PKG_DIR, "plot", "runs")
 _PLOT_SCRIPT = os.path.join(_SRC_PKG_DIR, "plot", "analyse_mpc_command_delay.py")
 RECORD_TOPICS = [
+    "/mpc_input",         # reference trajectory this node publishes to the OCP
     "/sensor",           # 1 kHz robot state published by the LFC
     "/ocp_x0",           # state actually fed to the solver (post delay prediction)
     "/control",          # commanded feedforward torque + Riccati gain
