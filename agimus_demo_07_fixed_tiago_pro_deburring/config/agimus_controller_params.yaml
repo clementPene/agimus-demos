@@ -7,11 +7,6 @@ agimus_controller_node:
   ros__parameters:
     rate: 100.0
     free_flyer: false
-    # MPC command-delay compensation (Subburaman & Stasse, Humanoids 2024):
-    # publish the previous cycle's OCP result (delay becomes a constant dt) and
-    # solve from the state integrated one dt forward with the last feedforward.
-    # Plain OCP here (DifferentialActionModelFreeFwdDynamics) -> the vanilla
-    # constant_delay path in agimus_controller works as-is (no augmented state).
     constant_delay: true
     collision_as_capsule: true
     ocp:
