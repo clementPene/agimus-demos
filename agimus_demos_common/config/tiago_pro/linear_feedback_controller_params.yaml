@@ -33,3 +33,12 @@ linear_feedback_controller:
     pd_to_lf_transition_duration: 0.1
     remove_gravity_compensation_effort: false
     robot_has_free_flyer: false
+    # MPC command-delay compensation (Subburaman & Stasse, Humanoids 2024).
+    # Needs the agimus_controller running with _APPLY_KNOT>0 so it publishes
+    # the next knot on /mpc_x_next. When reference_interpolation is true the
+    # LFC linearly interpolates its feedback reference from xs[k] to xs[k+1]
+    # across one MPC cycle instead of holding it (kills the staircase ref).
+    # feedback_lowpass_cutoff_hz > 0 adds a 2nd-order Butterworth on u_fb.
+    reference_interpolation: true
+    mpc_period: 0.01
+    feedback_lowpass_cutoff_hz: 0.0
