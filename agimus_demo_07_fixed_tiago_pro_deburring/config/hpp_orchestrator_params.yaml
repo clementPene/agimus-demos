@@ -22,7 +22,15 @@ tuck:
 
 # ── MPC weights ───────────────────────────────────────────────────────────────
 weights:
-  w_q: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]            # first guess only
+  # 1.0 -> 100: with w_frame_trans 1000 dominating, w_q 1.0 left the 7-DoF
+  # redundancy unconstrained -> the robot ended P1 ~0.72 rad from the HPP
+  # joint target q_final (nullspace drift), and the weak w_q still dragged the
+  # OCP *prediction* toward that far target -> phantom velocity ~0.5 rad/s in
+  # xs[1] (which knot-1 delay comp publishes to the LFC). 100 pins the
+  # redundancy to the HPP path; ee_target = FK(q) in _build_msg so this is
+  # consistent with the frame cost. NB: the robot now actually follows the
+  # HPP joint trajectory and ends at q_final.
+  w_q: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0]
   w_qdot: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]                # light damping
   w_qddot: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
   w_effort: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]       # torque regularization
