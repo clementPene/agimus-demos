@@ -114,7 +114,14 @@ RECORD_TOPICS = [
 
 
 class _TrajectoryPublisherNode(Node):
-    """One-shot ROS2 node that publishes pre-computed MpcInput messages."""
+    """One-shot ROS2 node that publishes pre-computed MpcInput messages.
+
+    Publishing is driven by an explicit deadline loop in Orchestrator.execute()
+    (see there), NOT a rclpy timer: the old ``create_timer(DT)`` + ``spin_once
+    + time.sleep(DT)`` combo actually ran at ~DT + overhead ≈ 20 ms → 49 Hz
+    instead of 100 Hz, so the reference trajectory played at half speed and the
+    OCP over-predicted joint velocity ~2x (see the phantom-velocity notes).
+    """
 
     def __init__(self, messages: list):
         super().__init__("hpp_trajectory_publisher")
@@ -122,7 +129,6 @@ class _TrajectoryPublisherNode(Node):
         self._idx = 0
         qos = QoSProfile(depth=1000, reliability=ReliabilityPolicy.BEST_EFFORT)
         self._pub = self.create_publisher(MpcInput, "mpc_input", qos)
-        self._timer = self.create_timer(DT, self._publish_next)
         self.get_logger().info(
             f"Publishing {len(self._messages)} trajectory points at {1 / DT:.0f} Hz …"
         )
@@ -133,7 +139,6 @@ class _TrajectoryPublisherNode(Node):
             if not self._done:
                 self.get_logger().info("Trajectory fully published.")
                 self._done = True
-            self._timer.cancel()
             return
         self._pub.publish(self._messages[self._idx])
         self._idx += 1
@@ -914,22 +919,35 @@ class Orchestrator:
             self._ros_node._messages = self._messages
             self._ros_node._idx = 0
             self._ros_node._done = False
-            self._ros_node._timer = self._ros_node.create_timer(
-                DT, self._ros_node._publish_next
-            )
 
         do_record = self.record if record is None else record
         tag = do_record if isinstance(do_record, str) else ""
         bag = self._start_bag(tag) if do_record else None
 
         print("Publishing trajectory …")
+        # Explicit deadline loop: publish one point every DT of *wall* time.
+        # perf_counter accumulator so slightly-long iterations self-correct and
+        # the average rate stays at 1/DT (the rclpy-timer version drifted to
+        # ~half rate — see _TrajectoryPublisherNode docstring).
+        period = DT
+        next_t = time.perf_counter()
+        late = 0
         try:
             while not self._ros_node._done:
+                self._ros_node._publish_next()
                 rclpy.spin_once(self._ros_node, timeout_sec=0.0)
-                time.sleep(DT)
+                next_t += period
+                slack = next_t - time.perf_counter()
+                if slack > 0:
+                    time.sleep(slack)
+                else:
+                    late += 1
+                    next_t = time.perf_counter()  # fell behind, resync
         except KeyboardInterrupt:
             print("\nExecution interrupted.")
         finally:
+            if late:
+                print(f"  publish loop fell behind on {late} iteration(s)")
             self._stop_bag(bag)
 
     # ── Pose comparison ───────────────────────────────────────────────────────
