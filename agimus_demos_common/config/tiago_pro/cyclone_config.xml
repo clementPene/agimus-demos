@@ -8,14 +8,14 @@
 
 
             <Interfaces>
-                <NetworkInterface name="wg-tiago-pro-25" priority="1" />
+                <NetworkInterface name="wg0" priority="1" />
                 <NetworkInterface name="lo" priority="0" />
             </Interfaces>
         </General>
         <Discovery>
             <ParticipantIndex>auto</ParticipantIndex>
             <Peers>
-                <Peer Address="10.68.0.1" />
+                <Peer Address="172.25.25.1" />
                 <Peer Address="localhost" />
             </Peers>
             <MaxAutoParticipantIndex>500</MaxAutoParticipantIndex>
