@@ -29,7 +29,14 @@ weights:
   # loss -> reverted. Compliant-OCP + hard knot-1 step don't mix; the fix for
   # the residual jitter is the paper's u3 (interpolate xs[1]->xs[2]), not w_q.
   w_q: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]            # first guess only
-  w_qdot: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]                # light damping
+  # w_qdot bumped 0.05 -> 1.0 on 2026-09-01 to kill the OCP "phantom velocity"
+  # (from a still start the OCP predicted |v| up to 0.62 rad/s at node 5 -> the
+  # nullspace velocity was ~free at 0.05, and it's what the u3 interpolation
+  # amplifies into rest chatter). Velocity DAMPING, not posture stiffness like
+  # w_q, so it should not bring back the "robot too stiff" problem. If motion
+  # gets sluggish, drop toward ~0.3; if not enough, add a terminal velocity
+  # cost in ocp_definition_file.yaml.
+  w_qdot: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]                       # velocity damping
   w_qddot: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
   w_effort: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]       # torque regularization
   w_collision: 0.0
