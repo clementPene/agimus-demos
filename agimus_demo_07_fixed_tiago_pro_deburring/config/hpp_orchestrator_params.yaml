@@ -22,15 +22,13 @@ tuck:
 
 # ── MPC weights ───────────────────────────────────────────────────────────────
 weights:
-  # 1.0 -> 100: with w_frame_trans 1000 dominating, w_q 1.0 left the 7-DoF
-  # redundancy unconstrained -> the robot ended P1 ~0.72 rad from the HPP
-  # joint target q_final (nullspace drift), and the weak w_q still dragged the
-  # OCP *prediction* toward that far target -> phantom velocity ~0.5 rad/s in
-  # xs[1] (which knot-1 delay comp publishes to the LFC). 100 pins the
-  # redundancy to the HPP path; ee_target = FK(q) in _build_msg so this is
-  # consistent with the frame cost. NB: the robot now actually follows the
-  # HPP joint trajectory and ends at q_final.
-  w_q: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0]
+  # w_q=100 tried 2026-09-01 (bag ..._wq100): killed the mid-horizon nullspace
+  # drift but node-1 |v| only 0.48->0.36, KKT 2e-5->9e-4 (solver
+  # iteration-limited -> didn't even reach q_final, still 0.8 rad off), robot
+  # felt stiff (high joint-space Riccati gain), chatter slightly worse. Net
+  # loss -> reverted. Compliant-OCP + hard knot-1 step don't mix; the fix for
+  # the residual jitter is the paper's u3 (interpolate xs[1]->xs[2]), not w_q.
+  w_q: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]            # first guess only
   w_qdot: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]                # light damping
   w_qddot: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
   w_effort: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]       # torque regularization
