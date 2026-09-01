@@ -42,3 +42,7 @@ linear_feedback_controller:
     reference_interpolation: true
     mpc_period: 0.01
     feedback_lowpass_cutoff_hz: 0.0
+    # Publishes /lfc_debug (std_msgs/Float64MultiArray, 1 kHz) with
+    # [time, alpha, q_ref, v_ref, u_ff, u_fb_raw, u_fb, u_cmd] for offline
+    # analysis of the interpolation / low-pass. Turn off in production.
+    debug_publish: true

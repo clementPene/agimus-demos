@@ -106,6 +106,8 @@ RECORD_TOPICS = [
     "/sensor",           # 1 kHz robot state published by the LFC
     "/ocp_x0",           # state actually fed to the solver (post delay prediction)
     "/control",          # commanded feedforward torque + Riccati gain
+    "/mpc_x_next",        # xs[k+1] published for the LFC u3 reference interpolation
+    "/lfc_debug",         # LFC 1 kHz internals: alpha, q/v_ref used, u_ff, u_fb raw/filt, u_cmd
     "/ocp_solve_time",   # OCP solve compute time
     "/mpc_debug",        # KKT norm, solver iters
 ]
