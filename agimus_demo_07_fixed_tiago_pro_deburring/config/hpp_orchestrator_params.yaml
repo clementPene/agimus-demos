@@ -37,8 +37,14 @@ weights:
   # gets sluggish, drop toward ~0.3; if not enough, add a terminal velocity
   # cost in ocp_definition_file.yaml.
   w_qdot: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]                       # velocity damping
-  w_qddot: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
-  w_effort: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]       # torque regularization
+  # NOTE: w_qddot is sent in /mpc_input but the generic OCP
+  # (ocp_croco_generic.py) has NO joint-acceleration cost -> this is INERT.
+  # The only acceleration lever available config-only is w_effort below:
+  # tau ~= M(q)*qddot + h(q,qdot), so penalising torque penalises accel.
+  w_qddot: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]        # inert (no OCP consumer)
+  # w_effort 0.001 -> 0.01 on 2026-09-01: damp the OCP-added initial
+  # acceleration burst (residual node-1 |v| ~0.3 at rest after w_qdot=1.0).
+  w_effort: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01]              # torque reg = accel proxy
   w_collision: 0.0
   w_frame_trans: [1000.0, 1000.0, 1000.0]                               # task priority
   w_frame_rot: [500.0, 500.0, 500.0]
