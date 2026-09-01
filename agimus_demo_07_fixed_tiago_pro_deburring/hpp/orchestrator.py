@@ -80,14 +80,29 @@ HANDLE_NAME = _cfg["handle"]["name"]
 LEFT_ARM_TUCK = _cfg["tuck"]["left_arm"]
 RIGHT_ARM_TUCK = _cfg["tuck"]["right_arm"]
 
-_w = _cfg["weights"]
-W_Q = np.array(_w["w_q"])
-W_QDOT = np.array(_w["w_qdot"])
-W_QDDOT = np.array(_w["w_qddot"])
-W_EFFORT = np.array(_w["w_effort"])
-W_COLLISION = _w["w_collision"]
-W_FRAME_TRANS = np.array(_w["w_frame_trans"])
-W_FRAME_ROT = np.array(_w["w_frame_rot"])
+def _reload_weights():
+    """Re-read the MPC weights from hpp_orchestrator_params.yaml into the module
+    globals. Called at the top of execute() so tuning the yaml doesn't need an
+    orchestrator restart."""
+    global W_Q, W_QDOT, W_QDDOT, W_EFFORT, W_COLLISION, W_FRAME_TRANS, W_FRAME_ROT
+    with open(_CFG_FILE) as f:
+        w = yaml.safe_load(f)["weights"]
+    W_Q = np.array(w["w_q"])
+    W_QDOT = np.array(w["w_qdot"])
+    W_QDDOT = np.array(w["w_qddot"])
+    W_EFFORT = np.array(w["w_effort"])
+    W_COLLISION = w["w_collision"]
+    W_FRAME_TRANS = np.array(w["w_frame_trans"])
+    W_FRAME_ROT = np.array(w["w_frame_rot"])
+    print(
+        f"  weights: w_q={W_Q[0]:g} w_qdot={W_QDOT[0]:g} w_qddot={W_QDDOT[0]:g} "
+        f"w_effort={W_EFFORT[0]:g} w_frame_trans={W_FRAME_TRANS[0]:g} "
+        f"w_frame_rot={W_FRAME_ROT[0]:g}"
+    )
+
+
+W_Q = W_QDOT = W_QDDOT = W_EFFORT = W_COLLISION = W_FRAME_TRANS = W_FRAME_ROT = None
+_reload_weights()
 
 # ── Optional rosbag recording around execute() ───────────────────────────────
 # Opt in per-call with execute(record=True) (or record="sometag"), or set
@@ -910,6 +925,7 @@ class Orchestrator:
             paths = [self.p1, self.p2, self.p3, self.p4]
         named = [(p, _labels.get(id(p), f"path_{i + 1}")) for i, p in enumerate(paths)]
 
+        _reload_weights()  # pick up edits to hpp_orchestrator_params.yaml without a restart
         print("Sampling trajectories …")
         self._messages = self._build_messages(named)
 
