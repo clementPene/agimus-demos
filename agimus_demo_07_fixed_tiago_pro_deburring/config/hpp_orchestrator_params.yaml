@@ -22,29 +22,10 @@ tuck:
 
 # ── MPC weights ───────────────────────────────────────────────────────────────
 weights:
-  # w_q=100 tried 2026-09-01 (bag ..._wq100): killed the mid-horizon nullspace
-  # drift but node-1 |v| only 0.48->0.36, KKT 2e-5->9e-4 (solver
-  # iteration-limited -> didn't even reach q_final, still 0.8 rad off), robot
-  # felt stiff (high joint-space Riccati gain), chatter slightly worse. Net
-  # loss -> reverted. Compliant-OCP + hard knot-1 step don't mix; the fix for
-  # the residual jitter is the paper's u3 (interpolate xs[1]->xs[2]), not w_q.
   w_q: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]            # first guess only
-  # w_qdot bumped 0.05 -> 1.0 on 2026-09-01 to kill the OCP "phantom velocity"
-  # (from a still start the OCP predicted |v| up to 0.62 rad/s at node 5 -> the
-  # nullspace velocity was ~free at 0.05, and it's what the u3 interpolation
-  # amplifies into rest chatter). Velocity DAMPING, not posture stiffness like
-  # w_q, so it should not bring back the "robot too stiff" problem. If motion
-  # gets sluggish, drop toward ~0.3; if not enough, add a terminal velocity
-  # cost in ocp_definition_file.yaml.
   w_qdot: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]                       # velocity damping
-  # NOTE: w_qddot is sent in /mpc_input but the generic OCP
-  # (ocp_croco_generic.py) has NO joint-acceleration cost -> this is INERT.
-  # The only acceleration lever available config-only is w_effort below:
-  # tau ~= M(q)*qddot + h(q,qdot), so penalising torque penalises accel.
-  w_qddot: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]        # inert (no OCP consumer)
-  # w_effort 0.001 -> 0.01 on 2026-09-01: damp the OCP-added initial
-  # acceleration burst (residual node-1 |v| ~0.3 at rest after w_qdot=1.0).
-  w_effort: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01]              # torque reg = accel proxy
+  w_qddot: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  w_effort: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]       # torque regularization
   w_collision: 0.0
   w_frame_trans: [1000.0, 1000.0, 1000.0]                               # task priority
   w_frame_rot: [500.0, 500.0, 500.0]
