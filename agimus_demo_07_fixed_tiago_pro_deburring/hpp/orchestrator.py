@@ -22,6 +22,7 @@ Run via orchestrator_node.py (sources both ros2_config.sh and hpp_config.sh).
 """
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -80,14 +81,29 @@ HANDLE_NAME = _cfg["handle"]["name"]
 LEFT_ARM_TUCK = _cfg["tuck"]["left_arm"]
 RIGHT_ARM_TUCK = _cfg["tuck"]["right_arm"]
 
-_w = _cfg["weights"]
-W_Q = np.array(_w["w_q"])
-W_QDOT = np.array(_w["w_qdot"])
-W_QDDOT = np.array(_w["w_qddot"])
-W_EFFORT = np.array(_w["w_effort"])
-W_COLLISION = _w["w_collision"]
-W_FRAME_TRANS = np.array(_w["w_frame_trans"])
-W_FRAME_ROT = np.array(_w["w_frame_rot"])
+def _reload_weights():
+    """Re-read the MPC weights from hpp_orchestrator_params.yaml into the module
+    globals. Called at the top of execute() so tuning the yaml doesn't need an
+    orchestrator restart."""
+    global W_Q, W_QDOT, W_QDDOT, W_EFFORT, W_COLLISION, W_FRAME_TRANS, W_FRAME_ROT
+    with open(_CFG_FILE) as f:
+        w = yaml.safe_load(f)["weights"]
+    W_Q = np.array(w["w_q"])
+    W_QDOT = np.array(w["w_qdot"])
+    W_QDDOT = np.array(w["w_qddot"])
+    W_EFFORT = np.array(w["w_effort"])
+    W_COLLISION = w["w_collision"]
+    W_FRAME_TRANS = np.array(w["w_frame_trans"])
+    W_FRAME_ROT = np.array(w["w_frame_rot"])
+    print(
+        f"  weights: w_q={W_Q[0]:g} w_qdot={W_QDOT[0]:g} w_qddot={W_QDDOT[0]:g} "
+        f"w_effort={W_EFFORT[0]:g} w_frame_trans={W_FRAME_TRANS[0]:g} "
+        f"w_frame_rot={W_FRAME_ROT[0]:g}"
+    )
+
+
+W_Q = W_QDOT = W_QDDOT = W_EFFORT = W_COLLISION = W_FRAME_TRANS = W_FRAME_ROT = None
+_reload_weights()
 
 _c = _cfg["contact"]
 FORCE_FRAME_ID = _c["frame_id"]
@@ -114,57 +130,47 @@ _SRC_PKG_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 _RUNS_DIR = os.path.join(_SRC_PKG_DIR, "plot", "runs")
 _PLOT_SCRIPT = os.path.join(_SRC_PKG_DIR, "plot", "plot_force_profile.py")
 RECORD_TOPICS = [
-    "/sensor_with_force",  # measured force (contacts[FT].wrench) + contact.active
-    "/mpc_input",          # target force ramp (ee_inputs[FT].force)
-    "/control",            # commanded feedforward torque -> |u|
-    "/ocp_x0",             # augmented x0 actually fed to the solver
-    "/ocp_solve_time",
-    "/mpc_debug",           # KKT norm, iters
+    "/mpc_input",           # reference trajectory + target force ramp (ee_inputs[FT].force)
+    "/sensor_with_force",   # measured state + force (contacts[FT].wrench) + contact.active
+    "/sensor",              # 1 kHz raw robot state published by the LFC
+    "/ocp_x0",              # augmented x0 actually fed to the solver
+    "/control",             # commanded feedforward torque + Riccati gain
+    "/mpc_x_next",          # xs[k+1] for the LFC u2/u3 reference interpolation
+    "/lfc_debug",           # LFC 1 kHz internals: alpha, q/v_ref, u_ff, u_fb raw/filt, u_cmd
+    "/ocp_solve_time",      # OCP solve compute time
+    "/mpc_debug",           # KKT norm, solver iters
 ]
 
 
 class _TrajectoryPublisherNode(Node):
-    """One-shot ROS2 node that publishes pre-computed MpcInput messages."""
+    """One-shot ROS2 node that publishes pre-computed MpcInput messages.
+
+    Publishing is driven by an explicit deadline loop in Orchestrator.execute()
+    (see there), NOT a rclpy timer: the old ``create_timer(DT)`` + ``spin_once
+    + time.sleep(DT)`` combo actually ran at ~DT + overhead ≈ 20 ms → 49 Hz
+    instead of 100 Hz, so the reference trajectory played at half speed and the
+    OCP over-predicted joint velocity ~2x (see the phantom-velocity notes).
+    """
 
     def __init__(self, messages: list):
         super().__init__("hpp_trajectory_publisher")
         self._messages = messages
         self._idx = 0
-        self._t_start = None
         qos = QoSProfile(depth=1000, reliability=ReliabilityPolicy.BEST_EFFORT)
         self._pub = self.create_publisher(MpcInput, "mpc_input", qos)
-        # Fire faster than DT; _publish_next catches up to wall-clock so the
-        # trajectory always plays at 1/DT regardless of timer/executor jitter
-        # (the old DT timer + a sleep(DT) in execute() halved the real rate).
-        self._timer = self.create_timer(DT / 4.0, self._publish_next)
         self.get_logger().info(
             f"Publishing {len(self._messages)} trajectory points at {1 / DT:.0f} Hz …"
         )
         self._done = False
 
-    def restart(self, messages: list) -> None:
-        """Re-arm for a fresh execute() on a reused node."""
-        self._messages = messages
-        self._idx = 0
-        self._t_start = None
-        self._done = False
-        self._timer = self.create_timer(DT / 4.0, self._publish_next)
-
     def _publish_next(self):
-        if self._t_start is None:
-            self._t_start = time.monotonic()
-        target = int((time.monotonic() - self._t_start) / DT) + 1
-        # Cap the burst: even if the clock is off, ramp in over a few ticks
-        # rather than dumping the whole trajectory into the MPC buffer.
-        stop = min(target, self._idx + 8, len(self._messages))
-        while self._idx < stop:
-            self._pub.publish(self._messages[self._idx])
-            self._idx += 1
         if self._idx >= len(self._messages):
             if not self._done:
                 self.get_logger().info("Trajectory fully published.")
                 self._done = True
-            self._timer.cancel()
+            return
+        self._pub.publish(self._messages[self._idx])
+        self._idx += 1
 
 
 class Orchestrator:
@@ -1034,28 +1040,45 @@ class Orchestrator:
             paths = [self.p1, self.p2, self.p3, self.p4]
         named = [(p, _labels.get(id(p), f"path_{i + 1}")) for i, p in enumerate(paths)]
 
+        _reload_weights()  # pick up edits to hpp_orchestrator_params.yaml without a restart
         print("Sampling trajectories …")
         self._messages = self._build_messages(named)
 
         if self._ros_node is None:
             self._ros_node = _TrajectoryPublisherNode(self._messages)
         else:
-            self._ros_node.restart(self._messages)
+            self._ros_node._messages = self._messages
+            self._ros_node._idx = 0
+            self._ros_node._done = False
 
         do_record = self.record if record is None else record
         tag = do_record if isinstance(do_record, str) else ""
         bag = self._start_bag(tag) if do_record else None
 
         print("Publishing trajectory …")
+        # Explicit deadline loop: publish one point every DT of *wall* time.
+        # perf_counter accumulator so slightly-long iterations self-correct and
+        # the average rate stays at 1/DT (the rclpy-timer version drifted to
+        # ~half rate — see _TrajectoryPublisherNode docstring).
+        period = DT
+        next_t = time.perf_counter()
+        late = 0
         try:
-            # spin_once blocks up to the timeout waiting for the publish timer;
-            # the timer + _publish_next's wall-clock catch-up keep the real
-            # rate at 1/DT. (No extra sleep — that's what halved the rate.)
             while not self._ros_node._done:
-                rclpy.spin_once(self._ros_node, timeout_sec=DT / 4.0)
+                self._ros_node._publish_next()
+                rclpy.spin_once(self._ros_node, timeout_sec=0.0)
+                next_t += period
+                slack = next_t - time.perf_counter()
+                if slack > 0:
+                    time.sleep(slack)
+                else:
+                    late += 1
+                    next_t = time.perf_counter()  # fell behind, resync
         except KeyboardInterrupt:
             print("\nExecution interrupted.")
         finally:
+            if late:
+                print(f"  publish loop fell behind on {late} iteration(s)")
             self._stop_bag(bag)
 
     # ── Pose comparison ───────────────────────────────────────────────────────

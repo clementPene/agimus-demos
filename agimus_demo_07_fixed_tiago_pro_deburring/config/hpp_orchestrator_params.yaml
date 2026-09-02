@@ -23,12 +23,12 @@ tuck:
 # ── MPC weights ───────────────────────────────────────────────────────────────
 weights:
   w_q: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]            # first guess only
-  w_qdot: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]                # light damping
-  w_qddot: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
+  w_qdot: [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]         # back to baseline for the HPP-warm-start test
+  w_qddot: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
   w_effort: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]       # torque regularization
   w_collision: 0.0
-  w_frame_trans: [1000.0, 1000.0, 1000.0]                               # task priority
-  w_frame_rot: [500.0, 500.0, 500.0]
+  w_frame_trans: [100.0, 100.0, 100.0]                               # task priority (delay-comp retune 2026-09-02)
+  w_frame_rot: [50.0, 50.0, 50.0]
 
 # ── Deep insert ────────────────────────────────────────────────────────────
 # After p2 reaches the nominal hole (qg), orchestrator.py's

@@ -94,6 +94,10 @@ running_model:
         residual:
           class: ResidualModelFrameRotationStatic
           frame_id: gripper_right_tool_holder
+    # NOTE: `nullspace_vel_damping` (ResidualModelNullspaceVelocity) was tested
+    # here (bag 20260902_092617) — it halved the phantom velocity but doubled the
+    # redundant-DOF posture drift (0.20 -> 0.43 rad) and cost +2.4 ms solve.
+    # Reverted; the class stays in ocp_croco_generic.py, dormant.
 
 terminal_model:
   class: IAMSoftContactAugmented
