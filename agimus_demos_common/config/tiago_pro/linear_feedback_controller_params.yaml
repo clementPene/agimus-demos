@@ -39,14 +39,18 @@ linear_feedback_controller:
     # LFC linearly interpolates its feedback reference from xs[k] to xs[k+1]
     # across one MPC cycle instead of holding it (kills the staircase ref).
     # feedback_lowpass_cutoff_hz > 0 adds a 2nd-order Butterworth on u_fb (the
-    # paper's u3). Paper used 66 Hz; the residual knot-1 chatter on this robot
-    # is ~22-33 Hz, so 66 barely touches it -> 40 Hz here. Lower = more
-    # attenuation but more phase lag in the feedback loop; /lfc_debug records
-    # u_fb_raw (pre) and u_fb (post) so the effect is visible. Tune via the
-    # /tmp copy on the robot + `pal module restart controller_manager`.
-    reference_interpolation: true
+    # paper's u3). DO NOT re-enable without care: 40 Hz DESTABILISED the robot
+    # 2026-09-02 (bag ..._low_pass_filter_ufb2 — |qd| 5.9 rad/s, torque 119 N·m,
+    # run cut to 4.1 s). The ~25 Hz chatter is a closed-loop resonance; the
+    # filter's phase lag near it makes it worse. The paper's 66 Hz is safe but
+    # does nothing here. Wrong tool for this system — use a notch, lower K, or
+    # fix the OCP phantom velocity instead.
+    # u1 mode for the _KNOT_VELOCITY_FROM_MEASURED experiment (2026-09-02):
+    # interpolation OFF, filter OFF — isolate the effect of sending xs[k].q
+    # with v_ref = measured velocity.
+    reference_interpolation: false
     mpc_period: 0.01
-    feedback_lowpass_cutoff_hz: 40.0
+    feedback_lowpass_cutoff_hz: 0.0
     # Publishes /lfc_debug (std_msgs/Float64MultiArray, 1 kHz) with
     # [time, alpha, q_ref, v_ref, u_ff, u_fb_raw, u_fb, u_cmd] for offline
     # analysis of the interpolation / low-pass. Turn off in production.
