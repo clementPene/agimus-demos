@@ -45,7 +45,9 @@ linear_feedback_controller:
     # filter's phase lag near it makes it worse. The paper's 66 Hz is safe but
     # does nothing here. Wrong tool for this system — use a notch, lower K, or
     # fix the OCP phantom velocity instead.
-    reference_interpolation: true
+    # u1 mode (interp OFF, filter OFF) for the HPP-warm-start test —
+    # one variable at a time (the warm-start change is OCP-side).
+    reference_interpolation: false
     mpc_period: 0.01
     feedback_lowpass_cutoff_hz: 0.0
     # Publishes /lfc_debug (std_msgs/Float64MultiArray, 1 kHz) with
