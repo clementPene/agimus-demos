@@ -45,10 +45,7 @@ linear_feedback_controller:
     # filter's phase lag near it makes it worse. The paper's 66 Hz is safe but
     # does nothing here. Wrong tool for this system — use a notch, lower K, or
     # fix the OCP phantom velocity instead.
-    # u1 mode for the _KNOT_VELOCITY_FROM_MEASURED experiment (2026-09-02):
-    # interpolation OFF, filter OFF — isolate the effect of sending xs[k].q
-    # with v_ref = measured velocity.
-    reference_interpolation: false
+    reference_interpolation: true
     mpc_period: 0.01
     feedback_lowpass_cutoff_hz: 0.0
     # Publishes /lfc_debug (std_msgs/Float64MultiArray, 1 kHz) with
