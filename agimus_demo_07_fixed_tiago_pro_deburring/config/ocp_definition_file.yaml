@@ -49,6 +49,25 @@ running_model:
         residual:
           class: ResidualModelFrameRotationStatic
           frame_id: gripper_right_tool_holder
+    # Damps the joint velocity that does NOT move the tool (the redundant
+    # self-motion) toward the plan velocity -> kills the OCP "phantom velocity"
+    # at the source. Orthogonal to the frame tasks so `weight` can be strong
+    # without stiffening the task-space Riccati gains. (activation weights: 1.0
+    # is overwritten per cycle by `residual.weight`.)
+    - name: nullspace_vel_damping
+      update: true
+      weight: 1.0
+      cost:
+        class: CostModelResidual
+        activation:
+          class: ActivationModelWeightedQuad
+          weights: 1.0
+        residual:
+          class: ResidualModelNullspaceVelocity
+          frame_id: gripper_right_tool_holder
+          damping: 1.0e-3
+          weight: 30.0
+          track_plan_velocity: true
 
 terminal_model:
   class: IntegratedActionModelEuler
@@ -87,6 +106,20 @@ terminal_model:
         residual:
           class: ResidualModelFrameRotationStatic
           frame_id: gripper_right_tool_holder
+    - name: nullspace_vel_damping
+      update: true
+      weight: 1.0
+      cost:
+        class: CostModelResidual
+        activation:
+          class: ActivationModelWeightedQuad
+          weights: 1.0
+        residual:
+          class: ResidualModelNullspaceVelocity
+          frame_id: gripper_right_tool_holder
+          damping: 1.0e-3
+          weight: 30.0
+          track_plan_velocity: true
     constraints:
       # arm_right_3_link_sc vs pylone capsules
     - name: collision_arm3_pyl0
