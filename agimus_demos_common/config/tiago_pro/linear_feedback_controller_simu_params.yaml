@@ -1,9 +1,10 @@
 ---
 linear_feedback_controller:
   ros__parameters:
-    type: linear_feedback_controller/LinearFeedbackController
+    type: linear_feedback_controller/LinearFeedbackController  # ros2_control plugin class.
     moving_joint_names: [arm_right_1_joint, arm_right_2_joint, arm_right_3_joint, arm_right_4_joint,
-      arm_right_5_joint, arm_right_6_joint, arm_right_7_joint]
+      arm_right_5_joint, arm_right_6_joint, arm_right_7_joint]  # Joints controlled by the LFC.
+    # PD gains used during the startup PD-to-LF transition, per joint.
     arm_right_1_joint:
       p: 50.0
       d: 0.5
@@ -29,9 +30,13 @@ linear_feedback_controller:
       command_interfaces: [arm_right_1_joint_inertia_shaping_controller/arm_right_1_joint/effort,
         arm_right_2_joint_inertia_shaping_controller/arm_right_2_joint/effort, arm_right_3_joint_inertia_shaping_controller/arm_right_3_joint/effort,
         arm_right_4_joint_inertia_shaping_controller/arm_right_4_joint/effort, arm_right_5_joint_inertia_shaping_controller/arm_right_5_joint/effort,
-        arm_right_6_joint_inertia_shaping_controller/arm_right_6_joint/effort, arm_right_7_joint_inertia_shaping_controller/arm_right_7_joint/effort]
-      reference_prefix: ''
-    joint_velocity_filter_coefficient: 0.9
-    pd_to_lf_transition_duration: 0.1
-    remove_gravity_compensation_effort: false
-    robot_has_free_flyer: false
+        arm_right_6_joint_inertia_shaping_controller/arm_right_6_joint/effort, arm_right_7_joint_inertia_shaping_controller/arm_right_7_joint/effort]  # Downstream effort command interfaces, one per joint.
+      reference_prefix: ''  # Prefix for the downstream controller's reference topics.
+    joint_velocity_filter_coefficient: 0.9  # Exponential filter on the velocity sensor (1 = no filtering).
+    pd_to_lf_transition_duration: 0.1  # Duration (s) of the PD-to-LF startup blend.
+    remove_gravity_compensation_effort: false  # Subtract gravity compensation from the low-level driver's effort.
+    robot_has_free_flyer: false  # Fixed base here (no free-flyer).
+    reference_interpolation: false  # Interpolate the feedback reference to the next MPC knot instead of holding it.
+    feedback_lowpass_cutoff_hz: 0.0  # Low-pass on the feedback torque (Hz), 0 = off -- 40 Hz destabilised the robot, don't re-enable lightly.
+    feedback_gain_scale: 1.0  # Scales the feedback torque before adding the feedforward (1 = nominal).
+    debug_publish: false  # Publish /lfc_debug for offline analysis; keep off in production.

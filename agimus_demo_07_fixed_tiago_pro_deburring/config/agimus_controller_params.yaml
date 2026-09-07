@@ -5,31 +5,36 @@
 
 agimus_controller_node:
   ros__parameters:
-    rate: 100.0
-    free_flyer: false
-    collision_as_capsule: true
+    rate: 100.0  # MPC solve rate (Hz).
+    free_flyer: false  # Fixed base here (no free-flyer).
+    collision_as_capsule: true  # Approximate collision geometry as capsules.
+    self_collision: true  # Enable self-collision avoidance.
+    publish_buffer_size: false  # Publish trajectory buffer size for debugging.
+    publish_debug_data: true  # Publish OCP debug data.
+    constant_delay: false  # Re-solve from predicted state each cycle (unstable loop; keep off, use apply_knot).
+    apply_knot: 1  # Publish OCP knot k instead of knot 0 to compensate ~k*dt of delay (0 = off).
+    trajectory_buffer: standard  # Buffer strategy: "standard" (FIFO) or "constant" (hold latest, teleop).
     ocp:
-      dt: 0.01
-      # 50 -> 30: the force-feedback run (bag 20260827_151542) solved in
-      # ~13 ms mean / 34 ms max, 76% over the 10 ms budget @ 100 Hz — the
-      # trajectory played back at ~50 Hz and control lagged. 30 nodes
-      # (0.3 s lookahead) to get back under budget. Revisit once the
-      # contact scheme is settled.
-      horizon_size: 30
+      dt: 0.01  # OCP time step (s).
+      horizon_size: 30  # OCP horizon length (nodes); kept under the 10 ms solve budget.
       dt_factor_n_seq:
-        n_steps: [30]
+        n_steps: [30]  # Node spacing schedule.
         factors: [1]
-      armature: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
-      max_qp_iter: 50
-      max_iter: 5
-      activate_callback: false
-      effector_frame_name: gripper_right_tool_holder
-      definition_yaml_file: package://agimus_demo_07_fixed_tiago_pro_deburring/config/ocp_definition_file.yaml
-    robot_attachment_frame: universe
+      armature: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]  # Per-joint armature added to the rotor inertia.
+      max_qp_iter: 50  # Max QP iterations per solver iteration.
+      max_iter: 5  # Max solver iterations.
+      n_threads: 1  # Solver threads.
+      max_solve_time: 0.1  # Max solve time (s) before the solver gives up.
+      termination_tolerance: 0.001  # Solver convergence tolerance.
+      activate_callback: false  # Enable solver iteration callbacks.
+      effector_frame_name: gripper_right_tool_holder  # End-effector frame tracked by the OCP.
+      definition_yaml_file: package://agimus_demo_07_fixed_tiago_pro_deburring/config/ocp_definition_file.yaml  # OCP cost/constraint definition file.
+    robot_attachment_frame: universe  # Frame attaching the robot to the environment model.
+    moving_geometries_names: [""]  # Collision geometries that move at runtime (own subscriber each).
     collision_pairs_names: [cp_arm3_pyl0, cp_arm3_pyl1, cp_arm3_pyl2, cp_arm3_pyl3, cp_arm3_pyl4,
       cp_arm3_pyl5, cp_arm5_pyl0, cp_arm5_pyl1, cp_arm5_pyl2, cp_arm5_pyl3, cp_arm5_pyl4,
       cp_arm5_pyl5, cp_arm7_pyl0, cp_arm7_pyl1, cp_arm7_pyl2, cp_arm7_pyl3, cp_arm7_pyl4,
-      cp_arm7_pyl5]
+      cp_arm7_pyl5]  # Collision pairs checked by the OCP.
     cp_arm3_pyl0:
       first: arm_right_3_link_sc_capsule_0
       second: pylone_sc_link_capsule_0

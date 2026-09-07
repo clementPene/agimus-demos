@@ -1,9 +1,10 @@
 ---
 linear_feedback_controller:
   ros__parameters:
-    type: linear_feedback_controller/LinearFeedbackController
+    type: linear_feedback_controller/LinearFeedbackController  # ros2_control plugin class.
     moving_joint_names: [arm_right_1_joint, arm_right_2_joint, arm_right_3_joint, arm_right_4_joint,
-      arm_right_5_joint, arm_right_6_joint, arm_right_7_joint]
+      arm_right_5_joint, arm_right_6_joint, arm_right_7_joint]  # Joints controlled by the LFC.
+    # PD gains used during the startup PD-to-LF transition, per joint.
     arm_right_1_joint:
       p: 50.0
       d: 0.5
@@ -27,30 +28,13 @@ linear_feedback_controller:
       d: 0.0
     chainable_controller:
       command_interfaces: [arm_right_1_joint/effort, arm_right_2_joint/effort, arm_right_3_joint/effort,
-        arm_right_4_joint/effort, arm_right_5_joint/effort, arm_right_6_joint/effort, arm_right_7_joint/effort]
-      reference_prefix: ''
-    joint_velocity_filter_coefficient: 0.9
-    pd_to_lf_transition_duration: 0.1
-    remove_gravity_compensation_effort: false
-    robot_has_free_flyer: false
-    # MPC command-delay compensation (Subburaman & Stasse, Humanoids 2024).
-    # Needs the agimus_controller running with _APPLY_KNOT>0 so it publishes
-    # the next knot on /mpc_x_next. When reference_interpolation is true the
-    # LFC linearly interpolates its feedback reference from xs[k] to xs[k+1]
-    # across one MPC cycle instead of holding it (kills the staircase ref).
-    # feedback_lowpass_cutoff_hz > 0 adds a 2nd-order Butterworth on u_fb (the
-    # paper's u3). DO NOT re-enable without care: 40 Hz DESTABILISED the robot
-    # 2026-09-02 (bag ..._low_pass_filter_ufb2 — |qd| 5.9 rad/s, torque 119 N·m,
-    # run cut to 4.1 s). The ~25 Hz chatter is a closed-loop resonance; the
-    # filter's phase lag near it makes it worse. The paper's 66 Hz is safe but
-    # does nothing here. Wrong tool for this system — use a notch, lower K, or
-    # fix the OCP phantom velocity instead.
-    # u1 mode (interp OFF, filter OFF) for the HPP-warm-start test —
-    # one variable at a time (the warm-start change is OCP-side).
-    reference_interpolation: false
-    mpc_period: 0.01
-    feedback_lowpass_cutoff_hz: 0.0
-    # Publishes /lfc_debug (std_msgs/Float64MultiArray, 1 kHz) with
-    # [time, alpha, q_ref, v_ref, u_ff, u_fb_raw, u_fb, u_cmd] for offline
-    # analysis of the interpolation / low-pass. Turn off in production.
-    debug_publish: true
+        arm_right_4_joint/effort, arm_right_5_joint/effort, arm_right_6_joint/effort, arm_right_7_joint/effort]  # Downstream effort command interfaces, one per joint.
+      reference_prefix: ''  # Prefix for the downstream controller's reference topics.
+    joint_velocity_filter_coefficient: 0.9  # Exponential filter on the velocity sensor (1 = no filtering).
+    pd_to_lf_transition_duration: 0.1  # Duration (s) of the PD-to-LF startup blend.
+    remove_gravity_compensation_effort: false  # Subtract gravity compensation from the low-level driver's effort.
+    robot_has_free_flyer: false  # Fixed base here (no free-flyer).
+    reference_interpolation: false  # Interpolate the feedback reference to the next MPC knot instead of holding it.
+    feedback_lowpass_cutoff_hz: 0.0  # Low-pass on the feedback torque (Hz), 0 = off -- 40 Hz destabilised the robot, don't re-enable lightly.
+    feedback_gain_scale: 1.0  # Scales the feedback torque before adding the feedforward (1 = nominal).
+    debug_publish: true  # Publish /lfc_debug for offline analysis; keep off in production.
