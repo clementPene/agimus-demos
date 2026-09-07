@@ -38,3 +38,14 @@ linear_feedback_controller:
     feedback_lowpass_cutoff_hz: 0.0  # Low-pass on the feedback torque (Hz), 0 = off -- 40 Hz destabilised the robot, don't re-enable lightly.
     feedback_gain_scale: 1.0  # Scales the feedback torque before adding the feedforward (1 = nominal).
     debug_publish: true  # Publish /lfc_debug for offline analysis; keep off in production.
+    # Augmented Riccati force channel (STEP 2). n_directions>0 only applies
+    # K_f*(f0-f_meas) while force_sensor_filter.py reports contact.active on
+    # measured_topic -- inert (0 contribution) during any contact-free run,
+    # so P1/no-contact testing is unaffected. Test order per the safety
+    # discipline: no-contact first, THEN gentle push, THEN wall.
+    contact_force_feedback:
+      n_directions: 1
+      contact_name: wrist_right_ft_sensor_link
+      wrench_indices: [2]
+      measured_topic: sensor_with_force
+      activation_time_constant: 0.05
