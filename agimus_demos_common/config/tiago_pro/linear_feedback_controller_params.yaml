@@ -44,7 +44,7 @@ linear_feedback_controller:
     # so P1/no-contact testing is unaffected. Test order per the safety
     # discipline: no-contact first, THEN gentle push, THEN wall.
     contact_force_feedback:
-      n_directions: 1
+      n_directions: 0  # off for the ramp/knot regression campaign (plot/runs/ramp_knot_delaycomp_regression) -- set back to 1 before force_feedback_step2. Structural (read at controller activation), not live-reconfigurable like apply_knot -- needs a controller reload, not just `ros2 param set`.
       contact_name: wrist_right_ft_sensor_link
       wrench_indices: [2]
       measured_topic: sensor_with_force
