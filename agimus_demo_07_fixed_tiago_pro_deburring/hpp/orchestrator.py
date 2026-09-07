@@ -134,9 +134,12 @@ RECORD_TOPICS = [
     "/sensor_with_force",   # measured state + force (contacts[FT].wrench) + contact.active
     "/sensor",              # 1 kHz raw robot state published by the LFC
     "/ocp_x0",              # augmented x0 actually fed to the solver
-    "/control",             # commanded feedforward torque + Riccati gain
-    "/mpc_x_next",          # xs[k+1] for the LFC u2/u3 reference interpolation
-    "/lfc_debug",           # LFC 1 kHz internals: alpha, q/v_ref, u_ff, u_fb raw/filt, u_cmd
+    "/control",             # commanded feedforward torque + Riccati gain, and
+                            # (since the next_states refactor) xs[k+1] for the
+                            # LFC's u2/u3 reference interpolation -- no longer
+                            # a separate /mpc_x_next topic.
+    "/lfc_debug",           # LFC 1 kHz internals: alpha, q/v_ref, u_ff,
+                            # u_fb raw/filt, u_cmd, force_blend, u_fb_force
     "/ocp_solve_time",      # OCP solve compute time
     "/mpc_debug",           # KKT norm, solver iters
 ]
