@@ -27,8 +27,8 @@ weights:
   w_qddot: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
   w_effort: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]       # torque regularization
   w_collision: 0.0
-  w_frame_trans: [100.0, 100.0, 100.0]                               # task priority (delay-comp retune 2026-09-02)
-  w_frame_rot: [50.0, 50.0, 50.0]
+  w_frame_trans: [1000.0, 1000.0, 1000.0]                               # task priority (delay-comp retune 2026-09-02)
+  w_frame_rot: [500.0, 50.00, 500.0]
 
 # ── Deep insert ────────────────────────────────────────────────────────────
 # After p2 reaches the nominal hole (qg), orchestrator.py's
