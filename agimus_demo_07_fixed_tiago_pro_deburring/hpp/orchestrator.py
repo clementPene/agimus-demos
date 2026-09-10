@@ -85,7 +85,7 @@ def _reload_weights():
     """Re-read the MPC weights from hpp_orchestrator_params.yaml into the module
     globals. Called at the top of execute() so tuning the yaml doesn't need an
     orchestrator restart."""
-    global W_Q, W_QDOT, W_QDDOT, W_EFFORT, W_COLLISION, W_FRAME_TRANS, W_FRAME_ROT
+    global W_Q, W_QDOT, W_QDDOT, W_EFFORT, W_COLLISION, W_FRAME_TRANS, W_FRAME_ROT, W_NULLSPACE_POS
     with open(_CFG_FILE) as f:
         w = yaml.safe_load(f)["weights"]
     W_Q = np.array(w["w_q"])
@@ -95,14 +95,18 @@ def _reload_weights():
     W_COLLISION = w["w_collision"]
     W_FRAME_TRANS = np.array(w["w_frame_trans"])
     W_FRAME_ROT = np.array(w["w_frame_rot"])
+    # Default 0.0 (not 30.0, the OCP yaml's own fallback): an orchestrator
+    # config predating this key shouldn't silently turn the cost on.
+    W_NULLSPACE_POS = float(w.get("w_nullspace_pos", 0.0))
     print(
         f"  weights: w_q={W_Q[0]:g} w_qdot={W_QDOT[0]:g} w_qddot={W_QDDOT[0]:g} "
         f"w_effort={W_EFFORT[0]:g} w_frame_trans={W_FRAME_TRANS[0]:g} "
-        f"w_frame_rot={W_FRAME_ROT[0]:g}"
+        f"w_frame_rot={W_FRAME_ROT[0]:g} w_nullspace_pos={W_NULLSPACE_POS:g}"
     )
 
 
 W_Q = W_QDOT = W_QDDOT = W_EFFORT = W_COLLISION = W_FRAME_TRANS = W_FRAME_ROT = None
+W_NULLSPACE_POS = None
 _reload_weights()
 
 _c = _cfg["contact"]
@@ -874,6 +878,7 @@ class Orchestrator:
         msg.w_qddot = W_QDDOT.tolist()
         msg.w_robot_effort = W_EFFORT.tolist()
         msg.w_collision_avoidance = W_COLLISION
+        msg.w_nullspace_pos = W_NULLSPACE_POS
 
         T_ee = self._fk_ee(q)
         quat = pin.Quaternion(T_ee.rotation)

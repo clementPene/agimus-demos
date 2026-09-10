@@ -28,7 +28,7 @@ agimus_controller_node:
       termination_tolerance: 0.001  # Solver convergence tolerance.
       activate_callback: false  # Enable solver iteration callbacks.
       effector_frame_name: gripper_right_tool_holder  # End-effector frame tracked by the OCP.
-      definition_yaml_file: package://agimus_demo_07_fixed_tiago_pro_deburring/config/ocp_definition_file_nonaugmented_nullspace_pos.yaml  # OCP cost/constraint definition file. TEMPORARY: nullspace-position residual test (2026-09-09) -- revert to ocp_definition_file.yaml after.
+      definition_yaml_file: package://agimus_demo_07_fixed_tiago_pro_deburring/config/ocp_definition_file_nullspace_pos.yaml  # OCP cost/constraint definition file. TEMPORARY: nullspace-position residual on the augmented (production) OCP (2026-09-10) -- revert to ocp_definition_file.yaml after.
     robot_attachment_frame: universe  # Frame attaching the robot to the environment model.
     moving_geometries_names: [""]  # Collision geometries that move at runtime (own subscriber each).
     collision_pairs_names: [cp_arm3_pyl0, cp_arm3_pyl1, cp_arm3_pyl2, cp_arm3_pyl3, cp_arm3_pyl4,
