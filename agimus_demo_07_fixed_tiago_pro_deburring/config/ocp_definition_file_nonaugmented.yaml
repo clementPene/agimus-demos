@@ -1,0 +1,284 @@
+---
+# Non-augmented variant of ocp_definition_file.yaml, for the
+# plot/runs/velocity_filter_nonaugmented A/B campaign (2026-09-09).
+#
+# Plain [q, v] state (state_dim=14), no soft-contact force channel --
+# IntegratedActionModelEuler / DifferentialActionModelFreeFwdDynamics instead
+# of IAMSoftContactAugmented / DAMSoftContactAugmentedFwdDynamics. This is
+# byte-for-byte the dynamics/cost structure from commit 8cbcad0 (2026-09-02,
+# "test(OCP): add gravity reg cost"), which is what produced the
+# 20260902_111332_u1_gravity_comp_speed_weigth reference bag (small terminal
+# drift, 0.101 rad) -- reconstructed here on top of the current file's
+# terminal collision constraints (unrelated to state augmentation, added
+# after Sept 2 and unchanged since).
+#
+# Everything else (hpp_orchestrator_params.yaml's w_qdot/w_frame_trans/
+# w_frame_rot, ocp.dt/horizon_size, contact_force_feedback off) is shared
+# with the augmented file -- swapping definition_yaml_file in
+# agimus_controller_params.yaml is the only change needed to run this.
+#
+# Task-space priority: frame tracking dominates, state_reg is a first guess only.
+
+running_model:
+  class: IntegratedActionModelEuler
+  differential:
+    class: DifferentialActionModelFreeFwdDynamics
+    costs:
+    - name: state_reg
+      update: true
+      weight: 1.0
+      cost:
+        class: CostModelResidual
+        activation:
+          class: ActivationModelWeightedQuad
+          weights: 1.0
+        residual:
+          class: ResidualModelState
+    # Regularise the joint torque toward the *gravity-compensation* torque g(q)
+    # (r = u - g(q)), not toward zero. The LFC on TIAGo Pro does NOT strip gravity
+    # (`remove_gravity_compensation_effort: false`), so the OCP `u` is the full
+    # joint torque and `ResidualModelControl` (-> 0) was actively fighting the
+    # gravity load the OCP itself must produce -> static posture bias + rest u_fb
+    # offset. Non-augmented equivalent of the augmented file's
+    # `with_gravity_torque_reg: true` DAM flag (that flag only exists on
+    # DAMSoftContactAugmentedFwdDynamics).
+    - name: control_reg
+      update: true
+      weight: 1.0
+      cost:
+        class: CostModelResidual
+        activation:
+          class: ActivationModelWeightedQuad
+          weights: 1.0
+        residual:
+          class: ResidualModelControlGrav
+    - name: frame_trans_tracking_tool
+      update: true
+      weight: 1.0
+      cost:
+        class: CostModelResidual
+        activation:
+          class: ActivationModelWeightedQuad
+          weights: 1.0
+        residual:
+          class: ResidualModelFrameTranslationStatic
+          frame_id: gripper_right_tool_holder
+    - name: frame_rot_tracking_tool
+      update: true
+      weight: 1.0
+      cost:
+        class: CostModelResidual
+        activation:
+          class: ActivationModelWeightedQuad
+          weights: 1.0
+        residual:
+          class: ResidualModelFrameRotationStatic
+          frame_id: gripper_right_tool_holder
+    # NOTE: `nullspace_vel_damping` (ResidualModelNullspaceVelocity) was tested
+    # here (bag 20260902_092617) -- it halved the phantom velocity but doubled the
+    # redundant-DOF posture drift (0.20 -> 0.43 rad) and cost +2.4 ms solve.
+    # Reverted; the class stays in ocp_croco_generic.py, dormant.
+
+terminal_model:
+  class: IntegratedActionModelEuler
+  differential:
+    class: DifferentialActionModelFreeFwdDynamics
+    costs:
+    - name: state_reg
+      update: true
+      weight: 1.0
+      cost:
+        class: CostModelResidual
+        activation:
+          class: ActivationModelWeightedQuad
+          weights: 1.0
+        residual:
+          class: ResidualModelState
+    - name: frame_trans_tracking_tool
+      update: true
+      weight: 1.0
+      cost:
+        class: CostModelResidual
+        activation:
+          class: ActivationModelWeightedQuad
+          weights: 1.0
+        residual:
+          class: ResidualModelFrameTranslationStatic
+          frame_id: gripper_right_tool_holder
+    - name: frame_rot_tracking_tool
+      update: true
+      weight: 1.0
+      cost:
+        class: CostModelResidual
+        activation:
+          class: ActivationModelWeightedQuad
+          weights: 1.0
+        residual:
+          class: ResidualModelFrameRotationStatic
+          frame_id: gripper_right_tool_holder
+    constraints:
+      # arm_right_3_link_sc vs pylone capsules
+    - name: collision_arm3_pyl0
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_3_link_sc_capsule_0, pylone_sc_link_capsule_0]
+    - name: collision_arm3_pyl1
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_3_link_sc_capsule_0, pylone_sc_link_capsule_1]
+    - name: collision_arm3_pyl2
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_3_link_sc_capsule_0, pylone_sc_link_capsule_2]
+    - name: collision_arm3_pyl3
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_3_link_sc_capsule_0, pylone_sc_link_capsule_3]
+    - name: collision_arm3_pyl4
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_3_link_sc_capsule_0, pylone_sc_link_capsule_4]
+    - name: collision_arm3_pyl5
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_3_link_sc_capsule_0, pylone_sc_link_capsule_5]
+      # arm_right_5_link_sc vs pylone capsules
+    - name: collision_arm5_pyl0
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_5_link_sc_capsule_0, pylone_sc_link_capsule_0]
+    - name: collision_arm5_pyl1
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_5_link_sc_capsule_0, pylone_sc_link_capsule_1]
+    - name: collision_arm5_pyl2
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_5_link_sc_capsule_0, pylone_sc_link_capsule_2]
+    - name: collision_arm5_pyl3
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_5_link_sc_capsule_0, pylone_sc_link_capsule_3]
+    - name: collision_arm5_pyl4
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_5_link_sc_capsule_0, pylone_sc_link_capsule_4]
+    - name: collision_arm5_pyl5
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_5_link_sc_capsule_0, pylone_sc_link_capsule_5]
+      # arm_right_7_link_sc vs pylone capsules
+    - name: collision_arm7_pyl0
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_7_link_sc_capsule_0, pylone_sc_link_capsule_0]
+    - name: collision_arm7_pyl1
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_7_link_sc_capsule_0, pylone_sc_link_capsule_1]
+    - name: collision_arm7_pyl2
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_7_link_sc_capsule_0, pylone_sc_link_capsule_2]
+    - name: collision_arm7_pyl3
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_7_link_sc_capsule_0, pylone_sc_link_capsule_3]
+    - name: collision_arm7_pyl4
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_7_link_sc_capsule_0, pylone_sc_link_capsule_4]
+    - name: collision_arm7_pyl5
+      active: false
+      constraint:
+        class: ConstraintModelResidual
+        lower: 0.001
+        upper: inf
+        residual:
+          class: ResidualDistanceCollision
+          collision_pair: [arm_right_7_link_sc_capsule_0, pylone_sc_link_capsule_5]
