@@ -198,6 +198,12 @@ class Orchestrator:
         # Set True to auto-record every execute() run (see RECORD_TOPICS /
         # execute(record=...)). Per-call `record=` overrides this.
         self.record = False
+        # Seconds to keep `ros2 bag record` running after the trajectory
+        # finishes publishing, before SIGINT -- so a manual disturbance done
+        # right after the motion (e.g. pushing the end-effector) lands in the
+        # same bag. Per-call `record_linger=` overrides this. Ctrl-C during
+        # the linger stops it early.
+        self.record_linger = 0.0
 
         print("Loading HPP model …")
         self._setup_model()
@@ -1023,7 +1029,7 @@ class Orchestrator:
         print(f"  record: wrote {out}")
         print(f"  plot:   python3 {_PLOT_SCRIPT} {out}")
 
-    def execute(self, paths=None, record=None):
+    def execute(self, paths=None, record=None, record_linger=None):
         """
         Sample and publish MpcInput messages to the controller.
 
@@ -1033,6 +1039,10 @@ class Orchestrator:
                  RECORD_TOPICS under plot/runs/<timestamp>[_tag]/ — feeds
                  plot/plot_force_profile.py directly, no second terminal.
                  None (default) falls back to self.record.
+        record_linger : seconds to keep recording after the trajectory is
+                 done publishing, before stopping the bag (Ctrl-C ends it
+                 early). Use it to capture a manual disturbance right after
+                 the motion. None (default) falls back to self.record_linger.
         """
         if self.p1 is None:
             print("No path available — run plan() first.")
@@ -1084,6 +1094,15 @@ class Orchestrator:
                     next_t = time.perf_counter()  # fell behind, resync
         except KeyboardInterrupt:
             print("\nExecution interrupted.")
+        else:
+            linger = self.record_linger if record_linger is None else record_linger
+            if bag is not None and linger > 0:
+                print(f"  record: trajectory done — still recording {linger:.0f}s "
+                      f"(Ctrl-C to stop now).")
+                try:
+                    time.sleep(linger)
+                except KeyboardInterrupt:
+                    print("\n  record: linger stopped early.")
         finally:
             if late:
                 print(f"  publish loop fell behind on {late} iteration(s)")
