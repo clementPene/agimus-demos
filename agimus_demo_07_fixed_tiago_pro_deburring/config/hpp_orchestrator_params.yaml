@@ -23,13 +23,13 @@ tuck:
 # ── MPC weights ───────────────────────────────────────────────────────────────
 weights:
   w_q: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]            # first guess only
-  w_qdot: [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]         # back to baseline for the HPP-warm-start test
+  w_qdot: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]  # 2026-09-11: back to the 2026-08-28 working-baseline value (was bumped to 0.2 on 2026-09-02, which the augmented OCP never got re-verified against on robot).
   w_qddot: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
   w_effort: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]       # torque regularization
   w_collision: 0.0
-  w_frame_trans: [1000.0, 1000.0, 1000.0]   # tried 100 on the augmented OCP (bag 20260910_144821): cut v_pred ~30% but worse drift + solve over budget, still diverged. The non-aug OCP is healthy at 1000/500 (bag 20260910_111845) -- the augmented dynamics are the problem, not this weight.
+  w_frame_trans: [1000.0, 1000.0, 1000.0]   # task priority -- unchanged since 2026-08-28
   w_frame_rot: [500.0, 500.0, 500.0]
-  w_nullspace_pos: 30.0   # ResidualModelNullspacePosition gain (nullspace-position-test campaign, 2026-09-10) -- fallback in the OCP yaml is also 30.0, keep in sync until this is the only source
+  w_nullspace_pos: 30.0   # no-op on production ocp_definition_file.yaml (no nullspace cost there); only read by the *_nullspace_pos.yaml test files
 
 # ── Deep insert ────────────────────────────────────────────────────────────
 # After p2 reaches the nominal hole (qg), orchestrator.py's
