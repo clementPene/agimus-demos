@@ -36,7 +36,7 @@ linear_feedback_controller:
     robot_has_free_flyer: false  # Fixed base here (no free-flyer).
     reference_interpolation: false  # Interpolate the feedback reference to the next MPC knot instead of holding it.
     feedback_lowpass_cutoff_hz: 0.0  # Low-pass on the feedback torque (Hz), 0 = off -- 40 Hz destabilised the robot, don't re-enable lightly.
-    feedback_gain_scale: 1.0  # Scales the feedback torque before adding the feedforward (1 = nominal).
+    feedback_gain_scale: 0.0  # Scales the feedback torque before adding the feedforward (1 = nominal).
     debug_publish: true  # Publish /lfc_debug for offline analysis; keep off in production.
     # Augmented Riccati force channel (STEP 2). n_directions>0 only applies
     # K_f*(f0-f_meas) while force_sensor_filter.py reports contact.active on

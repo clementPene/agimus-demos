@@ -5,7 +5,7 @@
 
 agimus_controller_node:
   ros__parameters:
-    rate: 100.0  # MPC solve rate (Hz).
+    rate: 250.0  # MPC solve rate (Hz).
     free_flyer: false  # Fixed base here (no free-flyer).
     collision_as_capsule: true  # Approximate collision geometry as capsules.
     self_collision: true  # Enable self-collision avoidance.
@@ -15,14 +15,14 @@ agimus_controller_node:
     apply_knot: 0  # Publish OCP knot k instead of knot 0 to compensate ~k*dt of delay (0 = off). Back to 0 2026-09-10 while the augmented-OCP prediction is being fixed -- knot-1 amplifies it.
     trajectory_buffer: standard  # Buffer strategy: "standard" (FIFO) or "constant" (hold latest, teleop).
     ocp:
-      dt: 0.01  # OCP time step (s).
-      horizon_size: 30  # OCP horizon length (nodes); kept under the 10 ms solve budget.
+      dt: 0.004  # OCP time step (s).
+      horizon_size: 15  # OCP horizon length (nodes); kept under the 10 ms solve budget.
       dt_factor_n_seq:
-        n_steps: [30]  # Node spacing schedule.
+        n_steps: [15]  # Node spacing schedule.
         factors: [1]
       armature: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]  # Per-joint armature added to the rotor inertia.
-      max_qp_iter: 50  # Max QP iterations per solver iteration.
-      max_iter: 5  # Max solver iterations.
+      max_qp_iter: 100  # Max QP iterations per solver iteration.
+      max_iter: 20  # Max solver iterations.
       n_threads: 1  # Solver threads.
       max_solve_time: 0.1  # Max solve time (s) before the solver gives up.
       termination_tolerance: 0.001  # Solver convergence tolerance.
