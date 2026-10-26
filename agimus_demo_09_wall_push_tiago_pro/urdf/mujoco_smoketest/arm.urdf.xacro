@@ -1,0 +1,182 @@
+<?xml version="1.0"?>
+<!--
+  MuJoCo pipeline smoke test  —  NOT the wall-push demo itself.
+
+  Standalone right-arm-shaped robot (PAL's `pal_sea_arm_description`, no
+  end effector, no F/T sensor) used purely to check that MuJoCo <->
+  ros2_control <-> linear_feedback_controller <-> agimus_controller talk to
+  each other correctly. Joint names are `arm_right_1_joint`..`arm_right_7_joint`
+  (same convention as the real TIAGo Pro right arm)  —  do not reuse this
+  file's config for the actual wall-push demo (different fixed base, no
+  tool, no F/T sensor).
+
+  Uses `arm_type=tiago-pro` (not `pal-sea-arm-standalone`, PAL's own
+  "standalone arm" preset): `pal-sea-arm-standalone`'s own
+  `arm_properties/pal-sea-arm-standalone/arm.properties.xacro` has a latent
+  bug  —  its `origin_joint_2`/`_3`/`_5`/`_6`/`_7` macros only declare
+  `params="reflect"`, but `arm.urdf.xacro` unconditionally also passes
+  `name=`, so xacro rejects it with "Invalid parameter name". Reproduces
+  identically running PAL's own unmodified
+  pal_sea_arm_description/robots/pal_sea_arm.urdf.xacro with default args,
+  not something introduced here, and not something to patch in a vendored
+  package. `arm_type=tiago-pro` is the same physical SEA arm, just a
+  different (already correct, real-robot-tested) mesh/properties folder.
+
+  Unlike pal_sea_arm_description/robots/pal_sea_arm.urdf.xacro, this file:
+  - writes its own <ros2_control> block below instead of including
+    pal_sea_arm_description/ros2_control/ros2_control.urdf.xacro, because
+    that one's mujoco-ros2-control branch declares a `position_pid`
+    command_interface (arm.ros2_control.xacro:20-31) which
+    linear_feedback_controller cannot attach to (it needs `effort`).
+  - skips pal_mujoco_scenes (not packaged in this workspace) and mj_common
+    (defined by that same missing package)  —  MuJoCo's own default
+    world/lighting is enough for a smoke test.
+  - always emits mj_arm_actuators with mj_control=motor (torque actuators),
+    since pal_sea_arm.urdf.xacro only does this for sim_type=='mujoco', not
+    'mujoco-ros2-control'  —  our `effort` command interfaces need a real
+    MuJoCo <motor> to drive.
+-->
+<robot xmlns:xacro="http://ros.org/wiki/xacro" name="mujoco_smoketest_arm">
+
+  <xacro:arg name="use_sim_time" default="true"/>
+
+  <xacro:property name="arm_type" value="tiago-pro"/>
+  <xacro:property name="wrist_model" value="spherical-wrist"/>
+  <!-- Torque actuators (matches this file's <ros2_control> `effort` command
+       interfaces below)  —  must be set before mj_arm_actuators is invoked. -->
+  <xacro:property name="mj_control" value="motor"/>
+
+  <!-- INCLUDES -->
+  <xacro:include filename="$(find pal_urdf_utils)/urdf/deg_to_rad.urdf.xacro"/>
+  <xacro:include filename="$(find pal_urdf_utils)/urdf/materials.urdf.xacro"/>
+  <xacro:include filename="$(find pal_sea_arm_description)/urdf/arm/arm.urdf.xacro"/>
+  <xacro:include filename="$(find pal_sea_arm_description)/mujoco/mj_tags.xacro"/>
+
+  <!-- Fallback geometric-calibration deltas (arm.urdf.xacro expects these to
+       exist  —  pal_sea_arm.urdf.xacro defines the same zeros for the same
+       reason: this standalone entry point never includes
+       tiago_pro_description's geometric_calibration.urdf.xacro). -->
+  <xacro:property name="arm_right_1_dx" value="0.0"/>
+  <xacro:property name="arm_right_1_dy" value="0.0"/>
+  <xacro:property name="arm_right_1_dz" value="0.0"/>
+  <xacro:property name="arm_right_1_droll" value="0.0"/>
+  <xacro:property name="arm_right_1_dpitch" value="0.0"/>
+  <xacro:property name="arm_right_1_dyaw" value="0.0"/>
+  <xacro:property name="arm_right_2_dx" value="0.0"/>
+  <xacro:property name="arm_right_2_dy" value="0.0"/>
+  <xacro:property name="arm_right_2_dz" value="0.0"/>
+  <xacro:property name="arm_right_2_droll" value="0.0"/>
+  <xacro:property name="arm_right_2_dpitch" value="0.0"/>
+  <xacro:property name="arm_right_2_dyaw" value="0.0"/>
+  <xacro:property name="arm_right_3_dx" value="0.0"/>
+  <xacro:property name="arm_right_3_dy" value="0.0"/>
+  <xacro:property name="arm_right_3_dz" value="0.0"/>
+  <xacro:property name="arm_right_3_droll" value="0.0"/>
+  <xacro:property name="arm_right_3_dpitch" value="0.0"/>
+  <xacro:property name="arm_right_3_dyaw" value="0.0"/>
+  <xacro:property name="arm_right_4_dx" value="0.0"/>
+  <xacro:property name="arm_right_4_dy" value="0.0"/>
+  <xacro:property name="arm_right_4_dz" value="0.0"/>
+  <xacro:property name="arm_right_4_droll" value="0.0"/>
+  <xacro:property name="arm_right_4_dpitch" value="0.0"/>
+  <xacro:property name="arm_right_4_dyaw" value="0.0"/>
+  <xacro:property name="arm_right_5_dx" value="0.0"/>
+  <xacro:property name="arm_right_5_dy" value="0.0"/>
+  <xacro:property name="arm_right_5_dz" value="0.0"/>
+  <xacro:property name="arm_right_5_droll" value="0.0"/>
+  <xacro:property name="arm_right_5_dpitch" value="0.0"/>
+  <xacro:property name="arm_right_5_dyaw" value="0.0"/>
+  <xacro:property name="arm_right_6_dx" value="0.0"/>
+  <xacro:property name="arm_right_6_dy" value="0.0"/>
+  <xacro:property name="arm_right_6_dz" value="0.0"/>
+  <xacro:property name="arm_right_6_droll" value="0.0"/>
+  <xacro:property name="arm_right_6_dpitch" value="0.0"/>
+  <xacro:property name="arm_right_6_dyaw" value="0.0"/>
+  <xacro:property name="arm_right_7_dx" value="0.0"/>
+  <xacro:property name="arm_right_7_dy" value="0.0"/>
+  <xacro:property name="arm_right_7_dz" value="0.0"/>
+  <xacro:property name="arm_right_7_droll" value="0.0"/>
+  <xacro:property name="arm_right_7_dpitch" value="0.0"/>
+  <xacro:property name="arm_right_7_dyaw" value="0.0"/>
+
+  <!-- ROBOT DEFINITION -->
+  <link name="world"/>
+
+  <joint name="base_joint" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <parent link="world"/>
+    <child link="base_link"/>
+  </joint>
+  <link name="base_link">
+    <inertial>
+      <mass value="0.01"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+  </link>
+
+  <xacro:pal_sea_arm name="arm_right" parent="base_link" arm_type="${arm_type}"
+    tool_changer="True" wrist_model="${wrist_model}" reflect="1"
+    arm_1_offset="0" arm_2_offset="0" arm_3_offset="0" arm_4_offset="0"
+    arm_5_offset="0" arm_6_offset="0" arm_7_offset="0">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </xacro:pal_sea_arm>
+
+  <!-- MUJOCO: torque actuators for every arm joint, matching this file's
+       own <ros2_control> `effort` command interfaces below. -->
+  <mujoco>
+    <actuator>
+      <xacro:mj_arm_actuators name="arm_right" arm_type="${arm_type}" wrist_model="${wrist_model}" joint_reflect="1"/>
+    </actuator>
+  </mujoco>
+
+  <!-- ROS2 CONTROL: our own block (not pal_sea_arm_ros2_control)  —  see
+       file docstring for why. -->
+  <ros2_control name="mujoco_smoketest_system" type="system">
+    <hardware>
+      <plugin>mujoco_ros2_control/MujocoSystemInterface</plugin>
+    </hardware>
+    <joint name="arm_right_1_joint">
+      <command_interface name="effort"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="arm_right_2_joint">
+      <command_interface name="effort"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="arm_right_3_joint">
+      <command_interface name="effort"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="arm_right_4_joint">
+      <command_interface name="effort"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="arm_right_5_joint">
+      <command_interface name="effort"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="arm_right_6_joint">
+      <command_interface name="effort"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="arm_right_7_joint">
+      <command_interface name="effort"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+  </ros2_control>
+
+</robot>

@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>agimus_demo_09_wall_push_tiago_pro</name>
+  <version>0.0.0</version>
+  <description>
+    Wall-push demo for TIAGo Pro with fixed base (right arm only, 7 DOF).
+    Everything (robot bringup, LFC, whole-body force-feedback MPC, force
+    sensor filter, target publisher) launches from a single bringup.launch.py
+    -- no HPP, no interactive orchestrator. The right arm approaches a fixed
+    wall and holds contact, guarded by a hard force box constraint.
+  </description>
+  <maintainer email="gepetto@laas.fr">Gepetto Team</maintainer>
+  <license>BSD-2</license>
+  <url type="website">https://www.agimus-project.eu/</url>
+  <url type="repository">https://github.com/agimus-project/agimus-demos</url>
+  <url type="bugtracker">https://github.com/agimus-project/agimus-demos/issues</url>
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
+  <exec_depend>agimus_demos_common</exec_depend>
+  <exec_depend>linear_feedback_controller</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

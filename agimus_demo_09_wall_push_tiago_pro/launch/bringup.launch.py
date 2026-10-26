@@ -1,0 +1,274 @@
+"""
+Bringup launch file for the TIAGo Pro wall-push demo — fixed base (right arm only).
+
+Same set-up as demo 07 (the demo-07 pylone, at the same pose, is the "wall"),
+without the mocap correction. The motion itself is planned and played from the
+HPP orchestrator (hpp/orchestrator_node.py), not by this launch file.
+
+Usage:
+    ros2 launch agimus_demo_09_wall_push_tiago_pro bringup.launch.py use_gazebo:=true
+    ros2 launch agimus_demo_09_wall_push_tiago_pro bringup.launch.py robot_ip:=<ip> use_hpp_bridge:=true
+"""
+
+import os
+import yaml
+import math
+
+from launch import LaunchContext, LaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    ExecuteProcess,
+    OpaqueFunction,
+    RegisterEventHandler,
+)
+from launch.conditions import IfCondition
+from launch.event_handlers import OnProcessExit
+from launch.launch_description_entity import LaunchDescriptionEntity
+from launch.substitutions import (
+    Command,
+    FindExecutable,
+    LaunchConfiguration,
+    PathJoinSubstitution,
+    PythonExpression,
+)
+from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
+from launch_ros.substitutions import FindPackageShare
+
+from agimus_demos_common.launch_utils import (
+    generate_default_tiago_pro_args,
+    generate_include_launch,
+    get_use_sim_time,
+)
+from agimus_demos_common.mpc_debugger_node import mpc_debugger_node
+
+PKG = "agimus_demo_09_wall_push_tiago_pro"
+
+_pylone_pose_path = os.path.join(
+    os.path.dirname(__file__), "..", "config", "pylone_pose.yaml"
+)
+with open(_pylone_pose_path) as _f:
+    _pp = yaml.safe_load(_f)
+
+PYLONE_X = _pp["pylone_x"]
+PYLONE_Y = _pp["pylone_y"]
+PYLONE_Z = _pp["pylone_z"]
+
+
+# Convert quaternion [qx, qy, qz, qw] → roll/pitch/yaw for Gazebo spawn
+def _quat_to_rpy(q):
+    qx, qy, qz, qw = q
+    roll = math.atan2(2 * (qw * qx + qy * qz), 1 - 2 * (qx * qx + qy * qy))
+    pitch = math.asin(2 * (qw * qy - qz * qx))
+    yaw = math.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
+    return roll, pitch, yaw
+
+
+_quat = _pp.get("pylone_quat", [0.0, 0.0, 0.0, 1.0])
+PYLONE_ROLL, PYLONE_PITCH, PYLONE_YAW = _quat_to_rpy(_quat)
+
+
+def launch_setup(
+    context: LaunchContext, *args, **kwargs
+) -> list[LaunchDescriptionEntity]:
+
+    tiago_robot_launch = generate_include_launch(
+        "tiago_pro_common.launch.py",
+        extra_launch_arguments={
+            "tuck_arm": "False",
+            "end_effector_right": "pal-atc",
+            "end_effector_left": "pal-pro-gripper",
+        },
+    )
+
+    wait_for_non_zero_joints_node = Node(
+        package="agimus_demos_common",
+        executable="wait_for_non_zero_joints_node",
+        parameters=[get_use_sim_time()],
+        output="screen",
+    )
+
+    environment_publisher_node = Node(
+        package="agimus_demos_common",
+        executable="string_publisher",
+        name="environment_publisher",
+        parameters=[
+            {
+                "topic_name": "environment_description",
+                "string_value": ParameterValue(
+                    Command(
+                        [
+                            FindExecutable(name="xacro"),
+                            " ",
+                            PathJoinSubstitution(
+                                [
+                                    FindPackageShare(PKG),
+                                    "urdf",
+                                    "environment.urdf.xacro",
+                                ]
+                            ),
+                            " with_sc:=true",
+                            f" pylone_x:={PYLONE_X}",
+                            f" pylone_y:={PYLONE_Y}",
+                            f" pylone_z:={PYLONE_Z}",
+                            f" pylone_roll:={PYLONE_ROLL}",
+                            f" pylone_pitch:={PYLONE_PITCH}",
+                            f" pylone_yaw:={PYLONE_YAW}",
+                        ]
+                    ),
+                    value_type=str,
+                ),
+            }
+        ],
+    )
+
+    use_force_feedback = LaunchConfiguration("use_force_feedback")
+
+    agimus_controller_node = Node(
+        package="agimus_controller_ros",
+        executable="agimus_controller_node",
+        parameters=[
+            get_use_sim_time(),
+            PathJoinSubstitution(
+                [FindPackageShare(PKG), "config", "agimus_controller_params.yaml"]
+            ),
+        ],
+        remappings=[
+            ("robot_description_semantic", "robot_srdf_description"),
+            (
+                "sensor",
+                PythonExpression(
+                    [
+                        "'sensor_with_force' if '",
+                        use_force_feedback,
+                        "' == 'true' else 'sensor'",
+                    ]
+                ),
+            ),
+        ],
+        output="screen",
+    )
+
+    _scripts_dir = PathJoinSubstitution([FindPackageShare(PKG), "scripts"])
+
+    force_sensor_filter_node = ExecuteProcess(
+        cmd=[
+            "python3",
+            PathJoinSubstitution([_scripts_dir, "force_sensor_filter.py"]),
+        ],
+        output="screen",
+        condition=IfCondition(
+            PythonExpression(["'", use_force_feedback, "' == 'true'"])
+        ),
+    )
+
+    spawn_pylone_node = Node(
+        package="ros_gz_sim",
+        executable="create",
+        arguments=[
+            "-name",
+            "pylone",
+            "-string",
+            Command(
+                [
+                    FindExecutable(name="xacro"),
+                    " ",
+                    PathJoinSubstitution(
+                        [FindPackageShare(PKG), "urdf", "pylone.urdf.xacro"]
+                    ),
+                ]
+            ),
+            "-x",
+            str(PYLONE_X),
+            "-y",
+            str(PYLONE_Y),
+            "-z",
+            str(PYLONE_Z),
+            "-R",
+            str(PYLONE_ROLL),
+            "-P",
+            str(PYLONE_PITCH),
+            "-Y",
+            str(PYLONE_YAW),
+        ],
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("use_gazebo")),
+    )
+
+    mpc_debugger = mpc_debugger_node(
+        "gripper_right_tool_holder",
+        parent_frame="base_link",
+        cost_plot=True,
+        node_kwargs=dict(
+            condition=IfCondition(LaunchConfiguration("use_mpc_debugger")),
+            remappings=[
+                ("robot_description_semantic", "robot_srdf_description"),
+            ],
+        ),
+    )
+
+    hpp_bridge_node = ExecuteProcess(
+        cmd=[
+            "xterm",
+            "-hold",
+            "-T",
+            "HPP orchestrator",
+            "-e",
+            "bash -c 'python3 "
+            + os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hpp", "orchestrator_node.py")
+            + "'",
+        ],
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("use_hpp_bridge")),
+    )
+
+    return [
+        tiago_robot_launch,
+        spawn_pylone_node,
+        wait_for_non_zero_joints_node,
+        environment_publisher_node,
+        mpc_debugger,
+        force_sensor_filter_node,
+        RegisterEventHandler(
+            event_handler=OnProcessExit(
+                target_action=wait_for_non_zero_joints_node,
+                on_exit=[
+                    agimus_controller_node,
+                    hpp_bridge_node,
+                ],
+            )
+        ),
+    ]
+
+
+def generate_launch_description():
+    return LaunchDescription(
+        [
+            DeclareLaunchArgument(
+                "use_mpc_debugger",
+                default_value="false",
+                choices=["true", "false"],
+            ),
+            DeclareLaunchArgument(
+                "use_hpp_bridge",
+                default_value="false",
+                choices=["true", "false"],
+                description="Launch the HPP orchestrator shell in xterm.",
+            ),
+            DeclareLaunchArgument(
+                "use_force_feedback",
+                default_value="true",
+                choices=["true", "false"],
+                description=(
+                    "Launch force_sensor_filter.py (right arm F/T sensor -> "
+                    "contact detection) and remap agimus_controller_node's "
+                    "'sensor' input to its 'sensor_with_force' output. "
+                    "Safe to enable even with OCPCrocoGeneric: the extra "
+                    "force on x0 is simply ignored until the OCP switches "
+                    "to OCPCrocoForceFeedbackGeneric."
+                ),
+            ),
+        ]
+        + generate_default_tiago_pro_args()
+        + [OpaqueFunction(function=launch_setup)]
+    )

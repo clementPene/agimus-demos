@@ -1,0 +1,14 @@
+---
+simple_trajectory_publisher:
+  ros__parameters:
+    ee_frame_name: arm_right_tool_link
+    trajectory_name: sine_wave_configuration_space
+    w_q: [12.0]
+    w_qdot: [0.48]
+    w_qddot: [0.000001]
+    w_robot_effort: [0.0008]
+    w_pose: [0.5]
+    sine_wave:
+      period: [4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0]
+      scale_duration: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      amplitude: [0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15]

@@ -1,0 +1,8 @@
+---
+# Based on pal_sea_arm_controller_configuration/config/mujoco_controller_manager_cfg.yaml.
+controller_manager:
+  ros__parameters:
+    # 1 kHz like the real TIAGo Pro: the LFC applies the MPC's stiff Riccati gains
+    # every controller-manager cycle, at 100 Hz it goes unstable (|v|~43 rad/s).
+    update_rate: 1000 # Hz
+    use_sim_time: true

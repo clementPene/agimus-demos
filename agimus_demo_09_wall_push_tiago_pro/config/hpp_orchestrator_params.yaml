@@ -1,0 +1,55 @@
+---
+# HPP orchestrator parameters for the TIAGo Pro deburring demo (fixed base).
+#
+# State space (nv=7): 7 right arm joints
+# Config space (nq=7): 7 right arm joints
+
+# ── Trajectory sampling ───────────────────────────────────────────────────────
+trajectory:
+  dt: 0.01          # sampling period (s) — must match agimus_controller rate
+  time_scale: 1.0   # stretch HPP path time — increase to slow down execution
+
+# ── Handle ───────────────────────────────────────────────────────────────────
+# outside: pylone/hole_right_25
+# inside:  pylone/hole_right_inside_25
+handle:
+  name: pylone/hole_right_25
+
+# ── Arm tuck configurations ───────────────────────────────────────────────────
+tuck:
+  left_arm: [0.5, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0]
+  right_arm: [-0.5, -1.83, 0.47, -2.35, 0.0, -1.2, 0.0]
+
+# ── MPC weights ───────────────────────────────────────────────────────────────
+weights:
+  w_q: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]            # first guess only
+  w_qdot: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]  # 2026-09-11: back to the 2026-08-28 working-baseline value (was bumped to 0.2 on 2026-09-02, which the augmented OCP never got re-verified against on robot).
+  w_qddot: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  w_effort: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]       # torque regularization
+  w_collision: 0.0
+  w_frame_trans: [1000.0, 1000.0, 1000.0]   # task priority -- unchanged since 2026-08-28
+  w_frame_rot: [500.0, 500.0, 500.0]
+  w_nullspace_pos: 30.0   # no-op on production ocp_definition_file.yaml (no nullspace cost there); only read by the *_nullspace_pos.yaml test files
+
+# ── Deep insert ────────────────────────────────────────────────────────────
+# After p2 reaches the nominal hole (qg), orchestrator.py's
+# _append_deep_insert() continues the tool press_depth_m further INTO the
+# part: IK-solve qg_deep (tool at FK(qg) + press_depth_m along the approach
+# direction, same rotation), then a joint-space ramp qg -> qg_deep -> hold
+# -> qg. Cost WEIGHTS are the global `weights:` block — identical to every
+# other phase; q and the tool target stay consistent.
+# With a wall the real contact stops the arm short of qg_deep. Force
+# handling (constraint / cost, active_contact) is deferred — see the
+# ocp_definition_file.yaml comment. w_force_marker / press_w_frame_trans
+# below are unused this iteration.
+contact:
+  frame_id: wrist_right_ft_sensor_link
+  press_depth_m: 0.05      # how far past the nominal surface. 5cm = clearly
+                           # visible on a no-wall motion check; drop to ~1-2cm
+                           # once a wall + force regulation are back in.
+  press_ramp_s: 1.5        # ramp qg <-> qg_deep over this
+  post_p2_hold_s: 3.0      # dwell at qg (tool on the surface) right after p2,
+                           # before pushing deeper — lets you see p2's endpoint
+  press_hold_s: 5.0        # dwell at qg_deep (tool pushed in)
+  w_force_marker: 1.0e-4   # (unused this iteration) tiny w_force to enable active_contact
+  press_w_frame_trans: 60.0  # (unused this iteration) softer translation weight for a real contact
