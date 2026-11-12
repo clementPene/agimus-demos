@@ -6,7 +6,7 @@
 
 # ── Trajectory sampling ───────────────────────────────────────────────────────
 trajectory:
-  dt: 0.01          # sampling period (s) — must match agimus_controller rate
+  dt: 0.002         # sampling period (s) — must match agimus_controller rate. 2026-11-12: matches agimus_controller_params.yaml's rate=500Hz/ocp.dt=0.002 (Franka params; was 0.01 alongside rate=250Hz for the no-Riccati/4ms test).
   time_scale: 1.0   # stretch HPP path time — increase to slow down execution
 
 # ── Handle ───────────────────────────────────────────────────────────────────
